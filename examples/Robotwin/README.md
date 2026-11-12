@@ -1,6 +1,147 @@
 # 🚀 RoboTwin 2.0 Evaluation
 
 This document provides instructions for reproducing our **experimental results** with [RoboTwin2.0](https://github.com/RoboTwin-Platform/RoboTwin).  
+
+## Local VLAct OFT with state and target TCP
+
+The local experiment uses this VLAct checkout (`feat/oft-state-tcp`),
+`train_files/starvla_oft_state_tcp.yaml`, and the actual TCP-enriched data root:
+
+```text
+/scratch/jliu3375/datasets/RoboTwin-Clean-TCP
+```
+
+This is the selected **Clean-last** TCP variant, with 50 tasks, 2,500 episodes
+and 549,787 original training frames. The `robotwin_wrap_32` mix name selects
+the original task list and wrapped-angle action schema; the configured data
+root selects the TCP dataset. It does not redirect training to plain Clean.
+The existing manifest's schema-2 goal policy is preserved: sample from
+`[t+64, t+96)` when the complete window fits, otherwise use the last Clean
+observation. The additional RAW terminal frame is not a target in this variant.
+
+The model path is:
+
+```text
+frozen checkpoint VLM -> 32 action tokens -> trainable output projection
+                                             + State Encoder(current state)
+                                             + TCP Encoder(target_tcp_pose)
+                                             -> fresh OFT MLP action head
+```
+
+Set `datasets.vla_data.include_state` and `include_tcp` independently; the
+corresponding model flags interpolate these values. The VLM remains frozen
+and in eval mode. State is a numeric encoder input, not instruction text.
+Only the VLM subtree is restored from the released OFT checkpoint, leaving
+the new projection/encoders/head trainable. There is no time-budget input or
+scheduled VLM unfreezing. Switches define the saved architecture at model
+initialization; restore checkpoints with matching switches.
+
+The output projection is an additional layer after action-token extraction;
+it does not unfreeze or replace the VLM's final Transformer layer. For the
+selected Qwen3-VL-4B recipe, initialization and training are:
+
+| Module | Initialization | Trained |
+| --- | --- | --- |
+| Entire VLM, including its final layer | Released OFT checkpoint | No |
+| Output projection, `Linear(2560, 2560)` | Identity weights, zero bias | Yes |
+| State encoder, `14 -> 1024 -> 2560` with GELU | Random | Yes |
+| Target TCP encoder, `14 -> 1024 -> 2560` with GELU | Random | Yes |
+| OFT MLPResNet action head | Random; released head weights are skipped | Yes |
+
+The two encoders are independent MLPs. Their single-token outputs are added
+to the projected action embeddings by broadcasting over the 32 action slots.
+The original QwenOFT also uses an MLP action head. Its old `DiT-B` configuration
+label does not select a DiT, and `action_dit_loss` is a compatibility alias
+for the same action-regression objective.
+
+`target_tcp_pose` is the existing loader's future world-frame TCP in meters
+with wxyz quaternions, ordered left pose then right pose. It uses the dataset's
+TCP definition `p_TCP = p_EE + R(q) @ [0.12, 0, 0]`, without joint-state
+normalization. The policy server normalizes raw state using the original
+training transform; direct model calls take transformed state. Set
+`framework.conditioning.state_input_space: normalized` only for clients that
+already perform that transform. The server continues returning
+`normalized_actions`; the RoboTwin client applies the original action mapping.
+
+Run checks from this VLAct repository:
+
+```bash
+VLACT_PYTHON=/var/tmp/jliu3375/miniconda3/envs/starVLA/bin/python \
+  bash examples/Robotwin/train_files/run_oft_state_tcp.sh --config-only
+
+VLACT_PYTHON=/var/tmp/jliu3375/miniconda3/envs/starVLA/bin/python \
+  bash examples/Robotwin/train_files/run_oft_state_tcp.sh --validate-only
+```
+
+Omit the check flag to train after validation passes. Edit `TRAIN_GPU_IDS`
+and `TRAIN_NUM_PROCESSES` at the top of `run_oft_state_tcp.sh` before training
+(for example, `"0,1"` and `2` for two selected GPUs). The launcher includes the
+selected local GPU/team settings; choose your own GPUs and W&B team before
+using it on another account or machine. Validation does not require GPUs. External
+`CUDA_VISIBLE_DEVICES`/`NUM_PROCESSES` override those defaults. Multiple
+processes use native DDP. The launcher selects the prepared
+local Hugging Face cache and defaults to offline loading and disabled W&B.
+The original checkpoint remains the directly evaluated baseline.
+
+For live W&B curves, log in once in the training environment, then add
+`--wandb` (or `--wandb-mode online`) to the launcher:
+
+The W&B setup and logging paths were verified with W&B SDK 0.31.0.
+
+```bash
+python -m wandb login
+WANDB_PROJECT=VLAct_Robotwin_TCP \
+  bash examples/Robotwin/train_files/run_oft_state_tcp.sh --wandb
+```
+
+Set `WANDB_ENTITY` to select a team/workspace; otherwise the logged-in account
+default or only writable team is checked before loading the VLM. A login
+username is never guessed as an entity. A server-provided default can be
+read-only and is then skipped.
+The preflight reads entity/project permission metadata without creating a run;
+the final W&B initialization still determines whether a new project/run can
+be created. The actual `wandb.init` is therefore also called before loading
+the model, so authentication/run-creation failures do not load the 4B VLM.
+You may instead edit `TRAIN_WANDB_ENTITY` at the top of the launcher.
+To create a team at launch, leave that field empty and set
+`TRAIN_WANDB_CREATE_TEAM` to your chosen new team name. An existing team in
+your account is reused. New team creation requires the account's Default API
+organization in W&B user settings and permission to create teams there;
+the script does not create an organization. Configuration/data validation
+never creates teams. `WANDB_NAME` overrides the displayed run name. W&B receives
+the resolved training configuration, action loss, per-module learning rates,
+epoch and data/model times every `trainer.logging_frequency` updates (100 by
+default). For this wrapped-angle OFT experiment, monitor `action_loss`.
+Raw-subtraction MSE/MAE diagnostics are disabled, including their extra batch
+and inference pass. The official joint objective blends half wrapped L1 with
+half ordinary L1; it is not pure shortest-angle MAE. Benchmark success is
+measured separately by closed-loop evaluation. For an offline node,
+use `--wandb-mode offline` and later `wandb sync /path/to/offline-run-directory`.
+Logging remains disabled when no W&B mode is requested.
+
+With the supplied recipe, model weights are saved every 10,000 updates to
+`<run_root_dir>/<run_id>/checkpoints/steps_<step>_pytorch_model.pt`.
+Normal completion also writes `final_model/pytorch_model.pt` in that run
+directory. Both contain the complete model weights, including the frozen
+VLM and the trainable modules; optimizer, scheduler and RNG state are not
+saved. Keep the run's configuration and dataset statistics with its weights.
+
+These checks establish code/data integration, not benchmark success. The
+enhanced closed-loop benchmark still needs the same-scene expert provider to
+put future `target_tcp_pose` values into each policy request; a current TCP
+observation must not be substituted for that future target.
+
+中文：修改位于 VLAct，训练目录为 `RoboTwin-Clean-TCP`，已选择回退到 Clean
+最后观测帧的版本。原图像、动作和全部训练帧保留；state/TCP 独立开关，
+VLM 全程冻结，只训练输出 projection、两个 encoder 和随机初始化 OFT 头。
+完整 50 项闭环 benchmark 与训练入口分开，CPU/数据检查不代表已完成 benchmark。
+
+## Upstream baseline workflow and results
+
+The workflow and published scores below are retained from the upstream
+baseline documentation. Evaluation results for the state/TCP-conditioned
+model above have not yet been measured.
+
 The evaluation process consists of two main parts:  
 
 1. Setting up the `robotwin` environment and dependencies.  

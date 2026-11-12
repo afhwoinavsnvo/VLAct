@@ -8,6 +8,7 @@ import argparse
 from accelerate import PartialState
 from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
 from starVLA.model.framework.base_framework import baseframework
+from deployment.model_server.policy_wrapper import PolicyServerWrapper
 import torch, os
 
 
@@ -26,6 +27,7 @@ def main(args) -> None:
     if args.use_bf16: # False
         vla = vla.to(torch.bfloat16)
     vla = vla.to("cuda").eval()
+    policy = PolicyServerWrapper(vla, checkpoint_path=args.ckpt_path)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -33,11 +35,11 @@ def main(args) -> None:
 
     # start websocket server
     server = WebsocketPolicyServer(
-        policy=vla,
+        policy=policy,
         host="0.0.0.0",
         port=args.port,
         idle_timeout=args.idle_timeout,
-        metadata={"env": "simpler_env"},
+        metadata=policy.metadata,
     )
     logging.info("server running ...")
     server.serve_forever()

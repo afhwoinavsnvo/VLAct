@@ -261,6 +261,9 @@ def read_mode_config(pretrained_checkpoint):
         # Load VLA Config (and corresponding base VLM `ModelConfig`) from `config.json`
         try:
             ocfg = OmegaConf.load(str(config_yaml))
+            full_yaml = run_dir / "config.full.yaml"
+            if full_yaml.is_file():
+                ocfg = OmegaConf.merge(OmegaConf.load(str(full_yaml)), ocfg)
             global_cfg = OmegaConf.to_container(ocfg, resolve=True)
         except Exception as e:
             overwatch.error(f"❌ Failed to load YAML config `{config_yaml}`: {e}")

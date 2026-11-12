@@ -79,7 +79,7 @@ class _QWen3_VL_Interface(nn.Module):
 
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
-            attn_implementation="flash_attention_2",
+            attn_implementation=qwenvl_config.get("attn_implementation", "flash_attention_2"),
             dtype=torch.bfloat16,
         )
         processor = AutoProcessor.from_pretrained(model_id)
@@ -118,6 +118,21 @@ class _QWen3_VL_Interface(nn.Module):
             )
 
         return outputs
+
+    def encode_last_hidden_state(self, **kwargs):
+        """Keep OFT's original hidden-state definition without vocabulary logits."""
+        if kwargs.get("labels") is not None:
+            raise ValueError("The OFT feature API does not accept language-model labels")
+        kwargs.pop("labels", None)
+        device = kwargs["input_ids"].device if kwargs.get("input_ids") is not None else self.model.device
+        # Preserve full-model output-recording hooks. Calling model.model
+        # directly changes the final hidden-state convention in some versions.
+        kwargs.update(
+            use_cache=False, output_hidden_states=True, output_attentions=False,
+            return_dict=True, logits_to_keep=torch.empty(0, dtype=torch.long, device=device),
+        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return self.model(**kwargs).hidden_states[-1]
 
     def generate(
         self,

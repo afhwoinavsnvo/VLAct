@@ -9,7 +9,7 @@ A lightweight implementation that uses an action special token to parallelly pre
 conditioned on multi-view images plus a language instruction (shares parameters with the VLM).
 Inspired by OpenVLA-OFT
 Key Points:
-  - Qwen2.5 vision-language backbone
+  - Configured Qwen vision-language backbone
   - Injects an action special token into the VLM
   - Continuous action prediction via L1 regression over the action special token hidden states
 
@@ -19,6 +19,7 @@ Note: How to add special tokens to Qwen2.5:
   or /starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md （adpat a little code)
   
 """
+from contextlib import nullcontext
 from typing import List
 from tqdm import tqdm
 from typing import List, Optional, Tuple
@@ -45,7 +46,9 @@ AUTO_ANGULAR_JOINT_LOSS_GRIPPER_DIMS = {
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
+from starVLA.model.modules.vlm.image_preprocessing import preprocess_image_batch
 from starVLA.model.modules.action_model.MLP_ActionHeader import get_action_model
+from starVLA.model.modules.action_model.oft_conditioning import OFTConditioning
 from starVLA.model.modules.action_model.flow_matching_loss import blend_angular_wrap_abs_error
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
@@ -55,10 +58,10 @@ class Qwenvl_OFT(baseframework):
     Multimodal vision-language-action model.
 
     Components:
-      - Qwen2.5 VL interface for fused language/vision token embeddings
-      - Layer-wise QFormer for multi-layer feature aggregation
-      - DINO encoder for dense multi-view spatial tokens
-      - DiT diffusion head for future action sequence modeling
+      - Qwen VL interface for image/instruction token embeddings
+      - One action-token embedding per predicted action step
+      - Optional output projection and numeric state/target-TCP MLP encoders
+      - MLPResNet action head for direct continuous-action regression
 
     Focus: Predict future continuous actions conditioned on images + instruction.
     """
@@ -82,13 +85,47 @@ class Qwenvl_OFT(baseframework):
         config.framework.action_model.action_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
         self.action_model = get_action_model(config=self.config)
 
+        # Opt-in numeric conditions leave released checkpoints unchanged by default.
+        condition_cfg = config.framework.get("conditioning", {})
+        flags = {name: condition_cfg.get(name, default) for name, default in (
+            ("enabled", False), ("include_state", False), ("include_tcp", False), ("freeze_vlm", True),
+        )}
+        for name, value in flags.items():
+            if type(value) is not bool:
+                raise ValueError(f"framework.conditioning.{name} must be a boolean")
+        self.conditioning = OFTConditioning(
+            hidden_dim=config.framework.action_model.action_hidden_dim,
+            encoder_hidden_dim=condition_cfg.get("encoder_hidden_dim", 1024),
+            state_dim=condition_cfg.get("state_dim", 14),
+            tcp_dim=condition_cfg.get("tcp_dim", 14),
+            include_state=flags["include_state"], include_tcp=flags["include_tcp"], enabled=flags["enabled"],
+        )
+        if self.conditioning.enabled:
+            data_cfg = config.datasets.vla_data
+            for name in ("include_state", "include_tcp"):
+                if name in data_cfg:
+                    if type(data_cfg[name]) is not bool:
+                        raise ValueError(f"datasets.vla_data.{name} must be a boolean")
+                    if data_cfg[name] != flags[name]:
+                        raise ValueError(f"datasets.vla_data.{name} disagrees with framework.conditioning.{name}")
+            if data_cfg.get("include_time_budget", False) or config.framework.action_model.get("use_time_budget", False):
+                raise ValueError("Conditioned QwenOFT does not use time_budget; disable both budget switches")
+            if flags["freeze_vlm"]:
+                self.qwen_vl_interface.requires_grad_(False)
+                self.qwen_vl_interface.eval()
+                if hasattr(self.qwen_vl_interface.model, "gradient_checkpointing_disable"):
+                    self.qwen_vl_interface.model.gradient_checkpointing_disable()
+
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         # self.hidden_dim = config.framework.action_model.action_hidden_dim
         
         self.action_token = "🔍" # TODO also can add spacail token to Qwen, but too complex
-        self.action_token_id = self.qwen_vl_interface.processor.tokenizer("🔍", add_special_tokens=False)["input_ids"][0]
+        token_ids = self.qwen_vl_interface.processor.tokenizer("🔍", add_special_tokens=False)["input_ids"]
+        if self.conditioning.enabled and len(token_ids) != 1:
+            raise ValueError("OFT action placeholder must tokenize to one ID; use the checkpoint's matching processor")
+        self.action_token_id = token_ids[0]
 
         # L1 损失
         self.l1_loss = nn.L1Loss()
@@ -103,6 +140,60 @@ class Qwenvl_OFT(baseframework):
             "on",
         }
         self._logged_first_batch_image_sizes = False
+
+    def train(self, mode: bool = True):
+        """Train adapters/head while keeping a frozen checkpoint VLM in eval mode."""
+        super().train(mode)
+        if not any(parameter.requires_grad for parameter in self.qwen_vl_interface.parameters()):
+            self.qwen_vl_interface.eval()
+        return self
+
+    def _last_hidden(self, inputs):
+        frozen = not any(parameter.requires_grad for parameter in self.qwen_vl_interface.parameters())
+        # no_grad produces ordinary features that the trainable projection can
+        # save for backward; inference_mode would prevent that training path.
+        with (torch.no_grad() if frozen else nullcontext()):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                encode_last = getattr(self.qwen_vl_interface, "encode_last_hidden_state", None)
+                if self.conditioning.enabled and callable(encode_last):
+                    return encode_last(**inputs)
+                outputs = self.qwen_vl_interface(
+                    **inputs, output_attentions=False, output_hidden_states=True, return_dict=True,
+                )
+                return outputs.hidden_states[-1]
+
+    def _batch_condition(self, examples, key, dimension, parameter, *, aliases=()):
+        values = []
+        for index, example in enumerate(examples):
+            keys = [name for name in (key, *aliases) if name in example]
+            if not keys:
+                raise ValueError(f"QwenOFT requires '{key}' for every example (missing at batch index {index})")
+            tensors = []
+            for name in keys:
+                value = torch.as_tensor(example[name])
+                if value.shape == (dimension,):
+                    value = value.unsqueeze(0)
+                if value.shape != (1, dimension):
+                    raise ValueError(f"{name} at batch index {index} must have shape (1, {dimension}) or ({dimension},)")
+                tensors.append(value)
+            if any(not torch.allclose(tensors[0], value.to(tensors[0]), rtol=1e-6, atol=1e-6)
+                   for value in tensors[1:]):
+                raise ValueError(f"Conflicting {key} and {aliases} at batch index {index}")
+            values.append(tensors[0])
+        return torch.stack(values).to(device=parameter.device, dtype=parameter.dtype)
+
+    def _condition_action_queries(self, action_queries, examples):
+        if not self.conditioning.enabled:
+            return action_queries
+        parameter = next(self.conditioning.parameters())
+        action_queries = action_queries.to(device=parameter.device, dtype=parameter.dtype)
+        state = self._batch_condition(
+            examples, "state", self.conditioning.state_dim, parameter,
+        ) if self.conditioning.include_state else None
+        tcp = self._batch_condition(
+            examples, "target_tcp_pose", self.conditioning.tcp_dim, parameter, aliases=("tcp_pose", "target_pose"),
+        ) if self.conditioning.include_tcp else None
+        return self.conditioning(action_queries, state=state, tcp=tcp)
 
     def _log_batch_image_sizes_once(self, batch_images: List[List[Image.Image]], stage: str = "train") -> None:
         if self._logged_first_batch_image_sizes:
@@ -147,7 +238,7 @@ class Qwenvl_OFT(baseframework):
 
         Returns:
             dict:
-                action_loss (torch.Tensor): Scalar diffusion noise prediction loss.
+                action_loss (torch.Tensor): Scalar supervised action-regression loss.
         """
         batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
         instructions = [example["lang"] for example in examples]  # [B, str]
@@ -159,7 +250,11 @@ class Qwenvl_OFT(baseframework):
 
         image_size_buckets = getattr(self.config.datasets.vla_data, "image_size_buckets", None)
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-        if image_size_buckets is None and train_obs_image_size:
+        if self.conditioning.enabled:
+            batch_images = preprocess_image_batch(
+                batch_images, image_size_buckets=image_size_buckets, image_size=train_obs_image_size,
+            )
+        elif image_size_buckets is None and train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
         self._log_batch_image_sizes_once(batch_images, stage="train")
@@ -171,21 +266,14 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
+        last_hidden = self._last_hidden(qwen_inputs)  # [B, L, hidden_dim]
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # 提取动作 token embedding 作为动作预测查询
             input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(last_hidden, input_ids, action_token_id=self.action_token_id)  # [B, chunk_len, H]
+            action_queries = self._condition_action_queries(action_queries, examples)
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
 
             # 标签对齐：取最后 chunk_len 段
@@ -254,7 +342,7 @@ class Qwenvl_OFT(baseframework):
 
         Returns:
             dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
+                normalized_actions (np.ndarray): Shape [B, T, action_dim], directly regressed actions.
         """
         if type(examples) is not list:
             examples = [examples]
@@ -264,7 +352,11 @@ class Qwenvl_OFT(baseframework):
     
         image_size_buckets = getattr(self.config.datasets.vla_data, "image_size_buckets", None)
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-        if image_size_buckets is None and train_obs_image_size:
+        if self.conditioning.enabled:
+            batch_images = preprocess_image_batch(
+                batch_images, image_size_buckets=image_size_buckets, image_size=train_obs_image_size,
+            )
+        elif image_size_buckets is None and train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
     
         # step 0: add special action token to instruction
@@ -274,24 +366,17 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
+        last_hidden = self._last_hidden(qwen_inputs)  # [B, L, hidden_dim]
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # 提取动作 token embedding 作为动作预测查询
             input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(last_hidden, input_ids, action_token_id=self.action_token_id)  # [B, chunk_len, H]
+            action_queries = self._condition_action_queries(action_queries, examples)
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        normalized_actions = pred_actions.detach().float().cpu().numpy()
         return {"normalized_actions": normalized_actions}
 
     def _compute_action_loss(

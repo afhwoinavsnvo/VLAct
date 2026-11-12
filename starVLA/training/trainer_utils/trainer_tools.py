@@ -8,12 +8,17 @@ endpoints (e.g., JSONL local logs, Weights & Biases).
 from typing import Tuple
 import re
 import json
+import zipfile
 import numpy as np
 import torch
 
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _dist_rank():
+    return dist.get_rank() if dist.is_initialized() else 0
 
 
 # === Define Tracker Interface ===
@@ -92,7 +97,7 @@ def build_param_lr_groups(model, cfg):
             for attr in module_name.split("."):
                 module = getattr(module, attr)
             # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            params = [p for p in module.parameters() if p.requires_grad and id(p) not in frozen_params and id(p) not in used_params]
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
@@ -100,7 +105,7 @@ def build_param_lr_groups(model, cfg):
             ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in used_params and id(p) not in frozen_params]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
 
@@ -188,7 +193,7 @@ class TrainerUtils:
                     continue
 
         # accelerator.wait_for_everyone()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if _dist_rank() == 0:
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -198,7 +203,7 @@ class TrainerUtils:
         print the total number of parameters and trainable parameters of the model
         :param model: PyTorch model instance
         """
-        if dist.get_rank() != 0:
+        if _dist_rank() != 0:
             return
         print("📊 model parameter statistics:")
         num_params = sum(p.numel() for p in model.parameters())
@@ -221,7 +226,7 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
-        if dist.get_rank() == 0:
+        if _dist_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
             if _is_safetensors_path(checkpoint_path):
@@ -229,7 +234,8 @@ class TrainerUtils:
 
                 checkpoint = load_file(checkpoint_path)
             else:
-                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True,
+                                        mmap=zipfile.is_zipfile(checkpoint_path))
         except Exception as e:
             raise RuntimeError(f"❌ loading checkpoint failed: {e}")
 
@@ -242,7 +248,7 @@ class TrainerUtils:
                 for k, v in checkpoint.items()
                 if not any(k == prefix or k.startswith(prefix + ".") for prefix in ignore_prefixes)
             }
-            if dist.get_rank() == 0 and ignore_prefixes:
+            if _dist_rank() == 0 and ignore_prefixes:
                 print(f"⏭️ skip loading checkpoint params for modules: {', '.join(ignore_prefixes)}")
 
         if reload_modules:  # partial load
@@ -257,17 +263,17 @@ class TrainerUtils:
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
                         module.load_state_dict(sub_state_dict, strict=True)
-                        if dist.get_rank() == 0:
+                        if _dist_rank() == 0:
                             print(f"✅ parameters loaded to module '{path}'")
                         loaded_modules.append(path)
                     else:
-                        print(f"⚠️ parameters not found in checkpoint '{path}'")
+                        raise RuntimeError(f"Requested module '{path}' is absent from checkpoint '{checkpoint_path}'")
                 except AttributeError:
-                    print(f"❌ cannot find module path: {path}")
+                    raise ValueError(f"Requested checkpoint module '{path}' does not exist in the model") from None
         else:  # full load
             try:
                 model.load_state_dict(checkpoint, strict=False)
-                if dist.get_rank() == 0:
+                if _dist_rank() == 0:
                     print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
@@ -310,6 +316,9 @@ class TrainerUtils:
         # 2. set new epoch (distributed core)
         if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
             dataloader.sampler.set_epoch(epoch_counter)
+        dataset_set_epoch = getattr(getattr(dataloader, "dataset", None), "set_epoch", None)
+        if callable(dataset_set_epoch):
+            dataset_set_epoch(epoch_counter)
 
         # 3. create new iterator
         return iter(dataloader), epoch_counter

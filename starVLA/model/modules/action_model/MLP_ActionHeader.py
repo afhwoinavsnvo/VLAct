@@ -94,9 +94,10 @@ def get_action_model(config=None):
     Args:
         config: Global config (expects config.framework.action_model namespace).
     Returns:
-        ActionModel: Initialized diffusion action head.
+        ActionModel: Initialized MLP action-regression head.
     """
     action_model_cfg = config.framework.action_model
+    # Legacy configurations may call this "DiT-B"; OFT always builds the MLP below.
     model_type = action_model_cfg.action_model_type
     action_hidden_dim = action_model_cfg.action_hidden_dim
     action_dim = action_model_cfg.action_dim

@@ -7,6 +7,7 @@ import cv2 as cv
 import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
+from deployment.model_server.policy_wrapper import TCP_KEY, TCP_ALIASES, _conditioning
 from starVLA.model.tools import read_mode_config
 
 try:
@@ -44,7 +45,18 @@ class ModelClient:
         self.action_mode = action_mode
         self.action_postprocess = action_postprocess.lower()
         self.robot_tag = robot_tag
+        model_config, self._checkpoint_statistics = read_mode_config(Path(policy_ckpt_path))
+        conditioning = _conditioning(model_config)
+        self.conditioning_enabled = conditioning is not None
+        self.include_state = self.conditioning_enabled and conditioning.get("include_state", False)
+        self.include_tcp = self.conditioning_enabled and conditioning.get("include_tcp", False)
+        self.state_input_space = conditioning.get("state_input_space", "raw") if conditioning is not None else None
+        self._training_data_cfg = model_config.get("datasets", {}).get("vla_data", {})
+        self._client_state_normalizer = None
         self.joint_action_unnorm_mode = self._infer_joint_action_unnorm_mode(policy_ckpt_path)
+        if self.conditioning_enabled:
+            data_mix = str(self._training_data_cfg.get("data_mix", ""))
+            self.joint_action_unnorm_mode = "wrap" if data_mix.startswith("robotwin_wrap") else "stats"
 
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
@@ -105,7 +117,22 @@ class ModelClient:
         images = [self._resize_image(image) for image in example["image"]]
         example["image"] = images
         example_copy = example.copy()
-        example_copy.pop("state")
+        if not self.include_state:
+            example_copy.pop("state", None)
+        elif state is None:
+            raise ValueError("Conditioned OFT requires a raw state observation")
+        elif self.state_input_space == "normalized":
+            # This client receives raw RoboTwin observations. Match a server
+            # explicitly configured for already-normalized state inputs.
+            if self._client_state_normalizer is None:
+                from deployment.model_server.state_normalization import RoboTwinStateNormalizer
+                key = self._check_unnorm_key(self._checkpoint_statistics, self.unnorm_key)
+                self._client_state_normalizer = RoboTwinStateNormalizer(
+                    self._training_data_cfg, self._checkpoint_statistics[key]
+                )
+            example_copy["state"] = self._client_state_normalizer.apply_state(state)
+        if self.include_tcp and not any(example_copy.get(key) is not None for key in (TCP_KEY, *TCP_ALIASES)):
+            raise ValueError("Conditioned OFT requires an externally supplied future target_tcp_pose")
         if self.robot_tag is not None:
             example_copy["robot_tag"] = self.robot_tag
         vla_input = {
@@ -114,6 +141,10 @@ class ModelClient:
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
         }
+        if self.conditioning_enabled:
+            # Use the same group selected by the existing client statistics
+            # helpers when the server normalizes raw state observations.
+            vla_input["unnorm_key"] = self._check_unnorm_key(self._checkpoint_statistics, self.unnorm_key)
 
         if step % self.action_chunk_size == 0 or self.raw_actions is None:
             response = self.client.predict_action(vla_input)
@@ -233,7 +264,8 @@ class ModelClient:
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         target_size = self._get_target_image_size(image)
-        return cv.resize(image, tuple(target_size), interpolation=cv.INTER_AREA)
+        interpolation = cv.INTER_LINEAR if self.conditioning_enabled else cv.INTER_AREA
+        return cv.resize(image, tuple(target_size), interpolation=interpolation)
 
     def _get_target_image_size(self, image: np.ndarray) -> list[int]:
         if self.image_size_buckets:
@@ -377,11 +409,19 @@ def eval(TASK_ENV, model, observation):
     images = [head_img, left_img, right_img]
 
     state = observation["joint_action"]["vector"]
+    if getattr(model, "conditioning_enabled", False) and getattr(model, "include_state", False):
+        # RoboTwin: L6,Lgrip,R6,Rgrip; training DataConfig: L6,R6,Lgrip,Rgrip.
+        state = np.asarray(state)[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
     example = {
         "lang": instruction,
         "image": images,
         "state": state,
     }
+    # An oracle/provider may attach a future goal explicitly. Never substitute
+    # the current end-effector/TCP observation for a missing future target.
+    for key in (TCP_KEY, *TCP_ALIASES):
+        if key in observation:
+            example[key] = observation[key]
 
     action = model.step(example, step=TASK_ENV.take_action_cnt)
     TASK_ENV.take_action(action)

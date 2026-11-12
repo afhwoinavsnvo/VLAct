@@ -37,6 +37,7 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, normalize_dotlist_args
+from starVLA.training.trainer_utils.wandb_setup import resolve_wandb_entity
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -47,13 +48,26 @@ logger = get_logger(__name__)
 
 def create_accelerator(cfg) -> Accelerator:
     gradient_accumulation_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
-    deepspeed_plugin = DeepSpeedPlugin(gradient_accumulation_steps=gradient_accumulation_steps)
+    deepspeed_plugin = (None if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1"
+                       else DeepSpeedPlugin(gradient_accumulation_steps=gradient_accumulation_steps))
     accelerator = Accelerator(
         deepspeed_plugin=deepspeed_plugin,
         gradient_accumulation_steps=gradient_accumulation_steps,
     )
     accelerator.print(accelerator.state)
     return accelerator
+
+
+def _unwrap_model(accelerator, model):
+    if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1":
+        return model.module if hasattr(model, "module") else model
+    return accelerator.unwrap_model(model)
+
+
+def _get_state_dict(accelerator, model):
+    if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1":
+        return _unwrap_model(accelerator, model).state_dict()
+    return accelerator.get_state_dict(model)
 
 
 def _as_bool(value) -> bool:
@@ -85,7 +99,8 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
-    dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
     return vla_train_dataloader
 
 
@@ -113,6 +128,40 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
     )
 
     return optimizer, lr_scheduler
+
+
+def initialize_wandb(config, accelerator):
+    """Initialize the actual run before loading model weights on any rank."""
+    if os.environ.get("WANDB_MODE", "online") == "disabled":
+        return False
+    failure = [None]
+    local_error = None
+    if accelerator.is_main_process:
+        try:
+            log_dir = Path(config.output_dir) / "wandb"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            full_config = config.unwrap() if isinstance(config, AccessTrackedConfig) else config
+            full_config = (OmegaConf.to_container(full_config, resolve=True)
+                           if OmegaConf.is_config(full_config) else dict(full_config))
+            run = wandb.init(
+                name=os.environ.get("WANDB_NAME") or config.run_id,
+                dir=str(log_dir),
+                project=os.environ.get("WANDB_PROJECT") or config.wandb_project,
+                entity=resolve_wandb_entity(config),
+                group="vla-train",
+                config=full_config,
+            )
+            if getattr(run, "url", None):
+                logger.info(f"W&B training dashboard: {run.url}")
+        except Exception as error:
+            local_error = error
+            failure[0] = f"W&B initialization failed before model loading: {error}"
+    if dist.is_initialized():
+        dist.broadcast_object_list(failure, src=0)
+    if failure[0] is not None:
+        raise RuntimeError(failure[0]) from local_error
+    accelerator.wait_for_everyone()
+    return True
 
 
 class VLATrainer(TrainerUtils):
@@ -150,7 +199,8 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
 
-        self._init_wandb()
+        if not hasattr(self, "_wandb_enabled"):
+            self._init_wandb()
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -161,15 +211,8 @@ class VLATrainer(TrainerUtils):
         )
 
     def _init_wandb(self):
-        """Initialize Weights & Biases."""
-        if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
-                group="vla-train",
-            )
+        """Compatibility path for callers constructing a trainer directly."""
+        self._wandb_enabled = initialize_wandb(self.config, self.accelerator)
 
     def _init_checkpointing(self):
         """Initialize checkpoint directory and handle checkpoint loading."""
@@ -244,7 +287,7 @@ class VLATrainer(TrainerUtils):
             save_format = getattr(self.config.trainer, "save_format", "pt")
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
-            state_dict = self.accelerator.get_state_dict(self.model)
+            state_dict = _get_state_dict(self.accelerator, self.model)
             if save_format == "safetensors":
                 from safetensors.torch import save_file
 
@@ -269,10 +312,14 @@ class VLATrainer(TrainerUtils):
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
-            metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+        if self.completed_steps % self.config.trainer.logging_frequency == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+            rates = self.lr_scheduler.get_last_lr()
+            metrics["learning_rate"] = rates[0]
+            for index, group in enumerate(self.optimizer.param_groups):
+                metrics[f"learning_rate/{group.get('name', index)}"] = rates[index]
             metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            wandb.log(metrics, step=self.completed_steps)
+            if getattr(self, "_wandb_enabled", False):
+                wandb.log(metrics, step=self.completed_steps, commit=True)
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _create_data_iterators(self):
@@ -325,7 +372,9 @@ class VLATrainer(TrainerUtils):
                 )
 
             if self.accelerator.sync_gradients:
-                if self.completed_steps % self.config.trainer.eval_interval == 0:
+                eval_interval = int(self.config.trainer.get("eval_interval", 0))
+                if (eval_interval > 0 and self.completed_steps % eval_interval == 0
+                        and self._action_error_diagnostics_enabled()):
                     step_metrics = self.eval_action_model(step_metrics)
 
                 step_metrics["data_time"] = t_end_data - t_start_data
@@ -340,11 +389,24 @@ class VLATrainer(TrainerUtils):
 
         self._finalize_training()
 
-    def eval_action_model(self, step_metrics: dict = None) -> float:
-        """Run simple action-eval on current batch and attach score to metrics."""
+    def _action_error_diagnostics_enabled(self) -> bool:
+        """Raw subtraction does not match OFT's wrapped-angle objective."""
+        framework = self.config.get("framework", {})
+        data = self.config.get("datasets", {}).get("vla_data", {})
+        wrapped_oft = framework.get("name") == "QwenOFT" and (
+            "wrap" in str(data.get("data_mix", ""))
+            or _as_bool(self.config.trainer.get("shortest_angular_joint_loss", False))
+        )
+        return not wrapped_oft
+
+    def eval_action_model(self, step_metrics: dict = None) -> dict:
+        """Optional raw-action diagnostics for non-wrapped representations."""
+        step_metrics = {} if step_metrics is None else step_metrics
+        if not self._action_error_diagnostics_enabled():
+            return step_metrics
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
-        output_dict = self.model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
+        output_dict = _unwrap_model(self.accelerator, self.model).predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
 
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
@@ -352,18 +414,17 @@ class VLATrainer(TrainerUtils):
                 predicted=normalized_actions,
                 ground_truth=actions,
             )
-            num_pots = np.count_nonzero(valid_mask)
-            if num_pots == 0:
-                step_metrics["mse_score"] = 0.0
-            else:
-                score = TrainerUtils.euclidean_distance(
-                    pred_actions * valid_mask,
-                    gt_actions * valid_mask,
-                )
-                step_metrics["mse_score"] = float(score / num_pots)
+            valid_count = np.count_nonzero(valid_mask)
+            if valid_count == 0:
+                raise ValueError("Cannot measure action error without valid target cells")
+            difference = pred_actions.astype(np.float64) - gt_actions.astype(np.float64)
+            # Training-loader diagnostics, not held-out validation or success rate.
+            step_metrics["train_action_mse"] = float(np.sum(difference ** 2 * valid_mask) / valid_count)
+            step_metrics["train_action_mae"] = float(np.sum(np.abs(difference) * valid_mask) / valid_count)
 
         del examples
-        dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
         return step_metrics
 
     @staticmethod
@@ -436,10 +497,12 @@ class VLATrainer(TrainerUtils):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
-            self.lr_scheduler.step()
+            if self.accelerator.sync_gradients:
+                self.lr_scheduler.step()
             self.optimizer.zero_grad()
 
         metrics = {
+            "action_loss": action_loss.item(),
             "action_dit_loss": action_loss.item(),
         }
         if "action_dit_loss" in output_dict:
@@ -458,7 +521,7 @@ class VLATrainer(TrainerUtils):
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
-            state_dict = self.accelerator.get_state_dict(self.model)
+            state_dict = _get_state_dict(self.accelerator, self.model)
             if save_format == "safetensors":
                 from safetensors.torch import save_file
 
@@ -469,7 +532,7 @@ class VLATrainer(TrainerUtils):
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):
             wandb.finish()
 
         self.accelerator.wait_for_everyone()
@@ -482,7 +545,14 @@ def main(cfg, accelerator) -> None:
     logger.info("✅ Configuration wrapped for access tracking")
 
     output_dir = setup_directories(cfg=cfg)
+    wandb_enabled = initialize_wandb(cfg, accelerator)
+    # Initialize fresh heads/adapters reproducibly before rank-specific seeds.
+    set_seed(int(cfg.seed))
     vla = build_framework(cfg)
+    if accelerator.is_main_process:
+        full_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg
+        OmegaConf.save(full_cfg, output_dir / "config.full.yaml", resolve=True)
+        OmegaConf.save(full_cfg, output_dir / "config.yaml", resolve=True)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
@@ -495,12 +565,14 @@ def main(cfg, accelerator) -> None:
         accelerator=accelerator,
     )
 
+    trainer._wandb_enabled = wandb_enabled
     trainer.prepare_training()
     trainer.train()
 
     logger.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -527,4 +599,8 @@ if __name__ == "__main__":
         print("🔍 Rank 0 waiting for debugger attach on port 10092...")
         debugpy.wait_for_client()
 
-    main(cfg, accelerator)
+    try:
+        main(cfg, accelerator)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
