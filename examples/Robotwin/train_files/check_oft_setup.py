@@ -21,6 +21,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from examples.Robotwin.train_files.prepare_clean_tcp_dataset import GOAL_POLICY, POSE_LAYOUT
+from deployment.model_server.pose_conventions import pose_layout, tcp_array_name, validate_quaternion_order
 
 
 def _sections(config):
@@ -76,6 +77,13 @@ def check_training_config(config) -> list[str]:
     model_representation = conditioning.get("state_representation", representation)
     if model_representation != representation:
         issues.append("Model and dataset state_representation disagree")
+    try:
+        order = validate_quaternion_order(data.get("tcp_quaternion_order", "wxyz"))
+        model_order = validate_quaternion_order(conditioning.get("tcp_quaternion_order", order))
+        if model_order != order:
+            issues.append("Model and dataset TCP quaternion orders disagree")
+    except ValueError as error:
+        issues.append(str(error))
     expected_mix = "robotwin_tcp_state_wrap_32" if representation == "tcp_pose" else "robotwin_wrap_32"
     if data.get("data_mix") != expected_mix:
         issues.append(f"datasets.vla_data.data_mix must be {expected_mix} for {representation} state")
@@ -196,11 +204,11 @@ def _check_checkpoint(config, issues):
     return summary
 
 
-def _sidecar_header(path):
+def _sidecar_header(path, array_name="tcp_pose_world_wxyz"):
     with np.load(path, allow_pickle=False) as archive:
         metadata = json.loads(str(archive["metadata_json"]))
     with zipfile.ZipFile(path) as archive:
-        with archive.open("tcp_pose_world_wxyz.npy") as stream:
+        with archive.open(array_name + ".npy") as stream:
             version = np.lib.format.read_magic(stream)
             if version == (1, 0):
                 shape, _, dtype = np.lib.format.read_array_header_1_0(stream)
@@ -233,6 +241,15 @@ def _check_data(config, issues):
     representation = data.get("state_representation", "joint")
     if manifest.get("state_representation", "joint") != representation:
         issues.append("Dataset manifest and configured state_representation disagree")
+    try:
+        order = validate_quaternion_order(data.get("tcp_quaternion_order", "wxyz"))
+    except ValueError as error:
+        issues.append(str(error))
+        order = "wxyz"
+    expected_layout = pose_layout(order)
+    array_name = tcp_array_name(order)
+    if manifest.get("quaternion_order", "wxyz") != order:
+        issues.append("Dataset manifest and configured TCP quaternion orders disagree")
     if policy != GOAL_POLICY:
         issues.append("TCP dataset target_sampling must match Clean-last GOAL_POLICY schema 2; RawLast is not allowed")
     summary["target_schema_version"] = policy.get("schema_version") if isinstance(policy, dict) else None
@@ -263,9 +280,11 @@ def _check_data(config, issues):
             public_episodes = [json.loads(line) for line in (task_dir / "meta/episodes.jsonl").read_text().splitlines() if line.strip()]
             if contract.get("target_sampling") != GOAL_POLICY:
                 issues.append(f"{name}: task target policy must be Clean-last schema 2")
-            for key, value in (("coordinate_frame", "world"), ("position_unit", "meters"), ("quaternion_order", "wxyz"), ("layout", POSE_LAYOUT)):
+            for key, value in (("coordinate_frame", "world"), ("position_unit", "meters"), ("quaternion_order", order), ("layout", expected_layout)):
                 if contract.get(key) != value:
                     issues.append(f"{name}: invalid TCP {key}")
+            if order == "xyzw" and (contract.get("schema_version") != 2 or contract.get("target_pose_array") != array_name):
+                issues.append(f"{name}: xyzw TCP contract requires schema 2 and explicit {array_name}")
             feature = info.get("features", {}).get("observation.tcp_pose", {})
             if feature.get("dtype") != "float32" or feature.get("shape") != [14]:
                 issues.append(f"{name}: TCP feature must be float32[14]")
@@ -275,9 +294,12 @@ def _check_data(config, issues):
                     issues.append(f"{name}: task and root state contracts disagree")
                 for key, value in (("state_representation", "tcp_pose"), ("current_frame", True),
                                    ("normalization_applied", False), ("coordinate_frame", "world"),
-                                   ("position_unit", "meters"), ("quaternion_order", "wxyz"), ("layout", POSE_LAYOUT)):
+                                   ("position_unit", "meters"), ("quaternion_order", order), ("layout", expected_layout)):
                     if state_contract.get(key) != value:
                         issues.append(f"{name}: invalid current TCP state {key}")
+                if order == "xyzw" and (state_contract.get("schema_version") != 2
+                                         or state_contract.get("target_pose_array") != array_name):
+                    issues.append(f"{name}: current xyzw state contract must declare schema 2 and {array_name}")
                 state_feature = info.get("features", {}).get("observation.state", {})
                 backup = info.get("features", {}).get("observation.joint_state", {})
                 if state_feature.get("dtype") != "float32" or state_feature.get("shape") != [14]:
@@ -318,11 +340,13 @@ def _check_data(config, issues):
                             issues.append(f"{parquet}: TCP schema must be fixed-size float32[14]")
                     if metadata.metadata.num_rows != length:
                         issues.append(f"{parquet}: row count disagrees with public_length")
-                    details, shape, dtype = _sidecar_header(sidecar)
+                    details, shape, dtype = _sidecar_header(sidecar, array_name)
                     if (details.get("task") != name or details.get("public_episode_id") != eid
                             or details.get("public_length") != length or details.get("raw_length") != length + 1
                             or details.get("target_sampling") != GOAL_POLICY):
                         issues.append(f"{sidecar}: identity/length/Clean-last target policy mismatch")
+                    if details.get("quaternion_order") != order or details.get("layout") != expected_layout:
+                        issues.append(f"{sidecar}: TCP quaternion order/layout mismatch")
                     if shape != (length + 1, 14) or dtype != np.dtype("float32"):
                         issues.append(f"{sidecar}: TCP array must be float32[public_length+1,14]")
                     record["checked_sidecars"] += 1

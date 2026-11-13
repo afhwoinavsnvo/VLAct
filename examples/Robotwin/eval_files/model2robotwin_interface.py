@@ -8,6 +8,7 @@ import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 from deployment.model_server.policy_wrapper import TCP_KEY, TCP_ALIASES, _conditioning
+from deployment.model_server.pose_conventions import reorder_tcp_pose, validate_quaternion_order
 from starVLA.model.tools import read_mode_config
 
 try:
@@ -52,6 +53,7 @@ class ModelClient:
         self.include_tcp = self.conditioning_enabled and conditioning.get("include_tcp", False)
         self.state_input_space = conditioning.get("state_input_space", "raw") if conditioning is not None else None
         self.state_representation = conditioning.get("state_representation", "joint") if conditioning is not None else "joint"
+        self.tcp_quaternion_order = conditioning.get("tcp_quaternion_order", "wxyz") if conditioning is not None else "wxyz"
         self._training_data_cfg = model_config.get("datasets", {}).get("vla_data", {})
         self._client_state_normalizer = None
         self.joint_action_unnorm_mode = self._infer_joint_action_unnorm_mode(policy_ckpt_path)
@@ -120,6 +122,11 @@ class ModelClient:
         images = [self._resize_image(image) for image in example["image"]]
         example["image"] = images
         example_copy = example.copy()
+        if self.include_tcp or (self.include_state and self.state_representation == "tcp_pose"):
+            supplied_order = validate_quaternion_order(example_copy.get("tcp_quaternion_order", self.tcp_quaternion_order))
+            if supplied_order != self.tcp_quaternion_order:
+                raise ValueError(f"Policy requires TCP quaternion order {self.tcp_quaternion_order}")
+            example_copy["tcp_quaternion_order"] = self.tcp_quaternion_order
         if not self.include_state:
             example_copy.pop("state", None)
         elif state is None:
@@ -400,8 +407,9 @@ def _format_instruction(instruction: str, control_frequency: Optional[int | floa
     return f"{instruction} Control frequency: {control_frequency}Hz."
 
 
-def _current_tcp_pose(observation):
+def _current_tcp_pose(observation, quaternion_order="wxyz"):
     """Read an explicit current TCP or convert the current EE observations."""
+    quaternion_order = validate_quaternion_order(quaternion_order)
     value = observation.get("current_tcp_pose")
     if value is not None:
         pose = np.asarray(value, dtype=np.float32).reshape(-1)
@@ -409,8 +417,9 @@ def _current_tcp_pose(observation):
             raise ValueError("current_tcp_pose must be a finite 14D pose")
         if not np.allclose(np.linalg.norm(pose[[3, 4, 5, 6, 10, 11, 12, 13]].reshape(2, 4), axis=-1),
                            1.0, rtol=0, atol=1e-5):
-            raise ValueError("current_tcp_pose requires unit wxyz quaternions")
-        return pose
+            raise ValueError("current_tcp_pose requires unit quaternions")
+        source_order = observation.get("current_tcp_quaternion_order", quaternion_order)
+        return reorder_tcp_pose(pose, source_order, quaternion_order)
     endpose = observation.get("endpose", {})
     arms = []
     for arm in ("left", "right"):
@@ -427,7 +436,8 @@ def _current_tcp_pose(observation):
         tcp = ee.copy()
         tcp[:3] += 0.12 * np.asarray([w*w+x*x-y*y-z*z, 2*(x*y+w*z), 2*(x*z-w*y)]) / norm_sq
         arms.append(tcp)
-    return np.concatenate(arms).astype(np.float32)
+    # RoboTwin endpose remains wxyz; convert once at the policy-input boundary.
+    return reorder_tcp_pose(np.concatenate(arms).astype(np.float32), "wxyz", quaternion_order)
 
 
 def eval(TASK_ENV, model, observation):
@@ -443,7 +453,7 @@ def eval(TASK_ENV, model, observation):
 
     conditioned_state = getattr(model, "conditioning_enabled", False) and getattr(model, "include_state", False)
     if conditioned_state and getattr(model, "state_representation", "joint") == "tcp_pose":
-        state = _current_tcp_pose(observation)
+        state = _current_tcp_pose(observation, getattr(model, "tcp_quaternion_order", "wxyz"))
     else:
         state = observation["joint_action"]["vector"]
         if conditioned_state:
@@ -459,6 +469,8 @@ def eval(TASK_ENV, model, observation):
     for key in (TCP_KEY, *TCP_ALIASES):
         if key in observation:
             example[key] = observation[key]
+    if "tcp_quaternion_order" in observation:
+        example["tcp_quaternion_order"] = observation["tcp_quaternion_order"]
 
     action = model.step(example, step=TASK_ENV.take_action_cnt)
     TASK_ENV.take_action(action)

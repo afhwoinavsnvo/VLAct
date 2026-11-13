@@ -2,7 +2,7 @@
 
 This module has no VLM or configuration dependencies. Callers provide tensors
 in the module's device/dtype. State uses the training state transform; target
-TCP retains the dataset's world-frame meters and wxyz quaternion convention.
+TCP retains the dataset's world-frame meters and declared quaternion convention.
 """
 
 import torch

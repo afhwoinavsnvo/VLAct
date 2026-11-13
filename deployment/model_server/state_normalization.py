@@ -10,6 +10,8 @@ import inspect
 
 import numpy as np
 
+from deployment.model_server.pose_conventions import validate_quaternion_order
+
 
 class RoboTwinStateNormalizer:
     """Apply the saved joint-state transform or preserve explicit raw TCP state."""
@@ -43,6 +45,7 @@ class RoboTwinStateNormalizer:
         if representation not in ("joint", "tcp_pose"):
             raise ValueError("state_representation must be 'joint' or 'tcp_pose'")
         self.pose_state = representation == "tcp_pose"
+        self.quaternion_order = validate_quaternion_order(data_cfg.get("tcp_quaternion_order", "wxyz"))
         if self.pose_state:
             self.KEY_DIMS = {"state.tcp_pose": 14}
         self.state_keys = list(data_config.state_keys)
@@ -98,7 +101,7 @@ class RoboTwinStateNormalizer:
         if self.pose_state:
             quaternions = values[:, [3, 4, 5, 6, 10, 11, 12, 13]].reshape(-1, 4)
             if not np.allclose(np.linalg.norm(quaternions, axis=-1), 1.0, rtol=0, atol=1e-5):
-                raise ValueError("TCP pose state requires unit wxyz quaternions for both arms")
+                raise ValueError(f"TCP pose state requires unit {self.quaternion_order} quaternions for both arms")
         parts = {}
         start = 0
         for key in self.state_keys:

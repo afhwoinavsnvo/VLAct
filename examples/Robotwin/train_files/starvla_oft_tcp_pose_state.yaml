@@ -1,5 +1,5 @@
 # Independent recipe: current TCP pose state plus a separate future TCP target.
-run_id: vlact_oft_tcp_pose_state_wrap32
+run_id: vlact_oft_tcp_pose_state_xyzw_wrap32
 run_root_dir: /scratch/jliu3375/runs
 seed: 42
 is_debug: false
@@ -25,6 +25,7 @@ framework:
     include_state: ${datasets.vla_data.include_state}
     include_tcp: ${datasets.vla_data.include_tcp}
     state_representation: ${datasets.vla_data.state_representation}
+    tcp_quaternion_order: ${datasets.vla_data.tcp_quaternion_order}
     state_dim: 14
     tcp_dim: 14
     encoder_hidden_dim: 1024
@@ -33,9 +34,10 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /scratch/jliu3375/datasets/RoboTwin-Clean-TCP-PoseState
+    data_root_dir: /scratch/jliu3375/datasets/RoboTwin-Clean-TCP-PoseState-XYZW
     data_mix: robotwin_tcp_state_wrap_32
     state_representation: tcp_pose
+    tcp_quaternion_order: xyzw
     expected_task_count: 50
     expected_episodes_per_task: 50
     include_state: true

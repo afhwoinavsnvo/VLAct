@@ -31,6 +31,16 @@ class OFTTCPPoseStateSetupTests(unittest.TestCase):
         cfg.framework.conditioning.state_representation = 'joint'
         self.assertTrue(any('state_representation disagree' in issue for issue in check_training_config(cfg)))
 
+    def test_current_recipe_declares_xyzw_for_both_inputs(self):
+        cfg = self.config()
+        self.assertEqual(cfg.datasets.vla_data.tcp_quaternion_order, 'xyzw')
+        self.assertEqual(cfg.framework.conditioning.tcp_quaternion_order, 'xyzw')
+
+    def test_model_quaternion_order_must_match_dataset(self):
+        cfg = self.config()
+        cfg.framework.conditioning.tcp_quaternion_order = 'wxyz'
+        self.assertTrue(any('quaternion orders disagree' in issue for issue in check_training_config(cfg)))
+
 
 if __name__ == '__main__':
     unittest.main()

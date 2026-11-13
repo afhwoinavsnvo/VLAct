@@ -150,23 +150,32 @@ observation must not be substituted for that future target.
 VLM 全程冻结，只训练输出 projection、两个 encoder 和随机初始化 OFT 头。
 完整 50 项闭环 benchmark 与训练入口分开，CPU/数据检查不代表已完成 benchmark。
 
-### Current TCP pose as the state input
+### Current TCP pose state with XYZW quaternions
 
 An independent dataset variant is available at:
 
 ```text
-/scratch/jliu3375/datasets/RoboTwin-Clean-TCP-PoseState
+/scratch/jliu3375/datasets/RoboTwin-Clean-TCP-PoseState-XYZW
 ```
 
-Its `observation.state` is the same observation frame's raw, float32 TCP pose:
-left `[x,y,z,qw,qx,qy,qz]` followed by right `[x,y,z,qw,qx,qy,qz]`, in world
-coordinates and meters. The original joint/gripper observation is backed up
-as `observation.joint_state`. The original `observation.tcp_pose`, joint/gripper
-actions, language, frame/episode IDs and future-target TCP sidecars remain
-aligned with the original Clean observations. Video directories share the
-original Clean files through links; no video files are copied.
+Both current `observation.state` / `observation.tcp_pose` and future
+`target_tcp_pose` use raw float32 TCP poses: left `[x,y,z,qx,qy,qz,qw]`
+followed by right `[x,y,z,qx,qy,qz,qw]`, in world coordinates and meters.
+The current state is from the same observation frame. The original joint/gripper
+observation is backed up as `observation.joint_state`; joint/gripper actions,
+language, frame/episode IDs and video correspondence remain unchanged.
+Video directories share the original Clean files through links.
 
-Use `robotwin_tcp_state_wrap_32` and explicit `state_representation: tcp_pose`.
+This directory is an exactly reversible component permutation of
+`RoboTwin-Clean-TCP-PoseState`, which remains unchanged with its original WXYZ
+order. TCP positions, quaternion signs and physical orientations are preserved.
+The canonical future sidecar array is `tcp_pose_world_xyzw`. Its original EE
+provenance array, `ee_pose_world_wxyz`, remains unchanged and explicitly WXYZ;
+`array_quaternion_orders` records the separate orders. State/TCP pose contracts
+use schema 2 and declare XYZW, independently of the unchanged goal-sampling schema.
+
+Use `robotwin_tcp_state_wrap_32`, explicit `state_representation: tcp_pose`,
+and `tcp_quaternion_order: xyzw`.
 This opt-in reader preserves state values and float32 precision, with no
 joint normalization, gripper thresholding, angle wrapping or state reordering.
 The action transforms remain the original joint-wrap32 transforms. Future
@@ -176,16 +185,26 @@ current pose state. Its two input switches remain independent.
 The separate recipe `train_files/starvla_oft_tcp_pose_state.yaml` computes new
 state statistics and has its own run ID. It keeps FlashAttention2, the original
 100-step extra-batch diagnostic and the original seed timing. The earlier
-released checkpoint expects joint state; the pose-state variant requires a
-newly trained state encoder/head.
+released checkpoint expects joint state; the pose-state variant requires
+newly trained state/TCP encoders and action head with the matching XYZW inputs.
+
+The independent full audit passed for all 50 tasks, 2,500 episodes, 549,787
+Clean observation rows, 552,287 full RAW pose frames and 7,500 shared videos.
+It verified exact forward/inverse permutations, unchanged Clean actions and
+metadata correspondence, statistics and sidecar SHA provenance. The maximum
+EE-to-TCP geometry error was `5.96e-8` meters. This is a dataset audit; it does
+not establish model or closed-loop benchmark performance.
 
 ```bash
-# Recreate the independent folder; an existing output is never overwritten.
+# If needed, first create the WXYZ pose-state source from Clean-TCP.
 python examples/Robotwin/train_files/prepare_tcp_state_dataset.py
 
+# Create the separate XYZW folder; existing output folders are never overwritten.
+python examples/Robotwin/train_files/prepare_tcp_xyzw_dataset.py
+
 # Full task/episode/frame correspondence, including all sidecars and videos.
-python examples/Robotwin/train_files/check_tcp_state_correspondence.py \
-  --report /scratch/jliu3375/logs/tcp_pose_state_clean_correspondence.json
+python examples/Robotwin/train_files/check_tcp_xyzw_correspondence.py \
+  --report /scratch/jliu3375/logs/tcp_xyzw_clean_correspondence.json
 
 # Validate this recipe before starting a new run.
 bash examples/Robotwin/train_files/run_oft_state_tcp.sh \

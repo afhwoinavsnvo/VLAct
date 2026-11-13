@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
+from deployment.model_server.pose_conventions import pose_layout, tcp_array_name, validate_quaternion_order
 from examples.Robotwin.train_files.prepare_clean_tcp_dataset import (
     GOAL_POLICY,
     RAW_LAST_GOAL_POLICY,
@@ -26,21 +27,20 @@ from examples.Robotwin.train_files.prepare_clean_tcp_dataset import (
 
 
 TCP_POSE_STATE_MIX = "robotwin_tcp_state_wrap_32"
-TCP_POSE_STATE_LAYOUT = [
-    f"{side}_{component}" for side in ("left", "right")
-    for component in ("x", "y", "z", "qw", "qx", "qy", "qz")
-]
+TCP_POSE_STATE_LAYOUT = pose_layout("wxyz")  # Legacy public constant retains its original meaning.
 
 
-def _validate_pose_state_contract(contract):
+def _validate_pose_state_contract(contract, order="wxyz"):
     expected = {
-        "schema_version": 1, "state_representation": "tcp_pose",
+        "schema_version": 2 if order == "xyzw" else 1, "state_representation": "tcp_pose",
         "feature": "observation.state", "source_feature": "observation.tcp_pose",
         "backup_joint_feature": "observation.joint_state",
         "current_frame": True, "normalization_applied": False,
         "dtype": "float32", "shape": [14], "coordinate_frame": "world",
-        "position_unit": "meters", "quaternion_order": "wxyz", "layout": TCP_POSE_STATE_LAYOUT,
+        "position_unit": "meters", "quaternion_order": order, "layout": pose_layout(order),
     }
+    if order == "xyzw":
+        expected["target_pose_array"] = tcp_array_name(order)
     if not isinstance(contract, dict):
         raise ValueError("Pose-state dataset manifest requires a state_contract mapping")
     for key, value in expected.items():
@@ -101,6 +101,10 @@ class TCPGoalDataset(Dataset):
         self.cache_size = cache_size
         self.include_state = include_state
         data_cfg = getattr(base, "data_cfg", None)
+        self.tcp_quaternion_order = data_cfg.get("tcp_quaternion_order", "wxyz") if data_cfg is not None else "wxyz"
+        validate_quaternion_order(self.tcp_quaternion_order)
+        self.tcp_pose_layout = pose_layout(self.tcp_quaternion_order)
+        self.target_pose_array = tcp_array_name(self.tcp_quaternion_order)
         configured_state = data_cfg.get("state_representation") if data_cfg is not None else None
         if state_representation is None:
             state_representation = configured_state or "joint"
@@ -116,12 +120,13 @@ class TCPGoalDataset(Dataset):
         manifest = _read_json(self._manifest_path)
         if manifest.get("status") != "passed":
             raise ValueError(f"TCP dataset manifest must have status 'passed': {self._manifest_path}")
+        self._validate_target_convention(manifest, "root manifest", require_layout=False)
         self.state_contract = None
         if self.state_representation == "tcp_pose":
             if manifest.get("state_representation") != "tcp_pose":
                 raise ValueError("Pose-state config requires state_representation='tcp_pose' in its dataset manifest")
             self.state_contract = deepcopy(manifest.get("state_contract"))
-            _validate_pose_state_contract(self.state_contract)
+            _validate_pose_state_contract(self.state_contract, self.tcp_quaternion_order)
         elif manifest.get("state_representation") == "tcp_pose":
             raise ValueError("Pose-state dataset requires explicit state_representation='tcp_pose' in the loader config")
         self.target_sampling = deepcopy(manifest.get("target_sampling"))
@@ -198,6 +203,7 @@ class TCPGoalDataset(Dataset):
         if name not in self._task_metadata:
             info = _read_json(task_dir / "meta/info.json")
             contract = _read_json(task_dir / "meta/tcp_pose.json")
+            self._validate_target_convention(contract, "task TCP contract", require_schema=True)
             if contract.get("target_sampling") != self.target_sampling:
                 raise ValueError(f"Task/root TCP target policy mismatch: {task_dir}")
             feature = info.get("features", {}).get("observation.tcp_pose", {})
@@ -229,6 +235,27 @@ class TCPGoalDataset(Dataset):
             self._checked_subsets.add(subset_key)
         return task_dir, info, contract
 
+    def _validate_target_convention(self, metadata, label, *, require_layout=True, require_schema=False):
+        """Reject mislabeled arrays; historical WXYZ metadata may omit new fields."""
+        order = self.tcp_quaternion_order
+        if metadata.get("quaternion_order", "wxyz") != order:
+            raise ValueError(f"TCP quaternion order in {label} disagrees with tcp_quaternion_order={order!r}")
+        if "layout" in metadata or (order == "xyzw" and require_layout):
+            if metadata.get("layout") != self.tcp_pose_layout:
+                raise ValueError(f"TCP layout in {label} does not match {order}")
+        if "target_pose_array" in metadata or order == "xyzw":
+            if metadata.get("target_pose_array") != self.target_pose_array:
+                raise ValueError(f"TCP target_pose_array in {label} does not match {order}")
+        if "array_quaternion_orders" in metadata or order == "xyzw":
+            arrays = metadata.get("array_quaternion_orders")
+            if not isinstance(arrays, dict) or any(arrays.get(key) != value for key, value in (
+                    ("ee_pose_world_wxyz", "wxyz"), (self.target_pose_array, order),
+            )):
+                raise ValueError(f"TCP array_quaternion_orders in {label} must identify target and EE provenance separately")
+        if order == "xyzw" and require_schema and (
+                type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 2):
+            raise ValueError(f"XYZW {label} requires schema_version=2")
+
     def _validate_pose_state_metadata(self, task_dir, info, tcp_contract):
         state_contract = _read_json(task_dir / "meta/state_pose.json")
         if state_contract != self.state_contract:
@@ -241,9 +268,13 @@ class TCPGoalDataset(Dataset):
             feature = features.get(name, {})
             if feature.get("dtype") != "float32" or feature.get("shape") != [14]:
                 raise ValueError(f"Pose-state dataset requires {name} float32[14]: {task_dir}")
-        names = features["observation.state"].get("names")
-        if names != TCP_POSE_STATE_LAYOUT and names != [TCP_POSE_STATE_LAYOUT]:
-            raise ValueError(f"Pose-state feature names do not match the TCP layout: {task_dir}")
+        names_to_check = ["observation.state"]
+        if self.tcp_quaternion_order == "xyzw":
+            names_to_check.append("observation.tcp_pose")
+        for name in names_to_check:
+            names = features[name].get("names")
+            if names != self.tcp_pose_layout and names != [self.tcp_pose_layout]:
+                raise ValueError(f"Pose-state feature names do not match the TCP layout: {task_dir}/{name}")
         state_mapping = _read_json(task_dir / "meta/modality.json").get("state", {})
         if (set(state_mapping) != {"tcp_pose"}
                 or any(state_mapping["tcp_pose"].get(key) != value for key, value in (
@@ -283,8 +314,10 @@ class TCPGoalDataset(Dataset):
             raise ValueError(f"TCP sidecar_template resolves outside its task TCP tree: {path}")
         try:
             with np.load(path, allow_pickle=False) as sidecar:
-                sequence = sidecar["tcp_pose_world_wxyz"].copy()
+                sequence = sidecar[self.target_pose_array].copy()
                 metadata = json.loads(str(sidecar["metadata_json"]))
+                if self.tcp_quaternion_order == "xyzw" and "ee_pose_world_wxyz" not in sidecar.files:
+                    raise ValueError("XYZW sidecar must retain the original WXYZ EE provenance array")
         except (OSError, ValueError, KeyError) as error:
             raise ValueError(f"Cannot load TCP episode sidecar {path}: {error}") from error
         if sequence.dtype != np.float32 or sequence.shape != (n_clean + 1, 14) or not np.isfinite(sequence).all():
@@ -294,6 +327,7 @@ class TCPGoalDataset(Dataset):
             raise ValueError(f"TCP sidecar public episode identity/length mismatch: {path}")
         if metadata.get("target_sampling") != self.target_sampling:
             raise ValueError(f"Sidecar/task/root TCP target policy mismatch: {path}")
+        self._validate_target_convention(metadata, "sidecar metadata")
         sequence.setflags(write=False)
         self._cache[key] = sequence
         if len(self._cache) > self.cache_size:
@@ -360,12 +394,15 @@ class TCPGoalDataset(Dataset):
             "state": ("Original loader output [1,14], preserved without reordering or renormalization."
                       if self.include_state else "Joint state is disabled; TCP targets do not require joint state."),
             "tcp_statistics_file": stats_target.name,
-            "statistics_note": "Training full-sequence diagnostics. Positions may support later normalization; keep wxyz quaternions unit and do not apply joint-state normalization to TCP.",
+            "statistics_note": f"Training full-sequence diagnostics. Positions may support later normalization; keep {self.tcp_quaternion_order} quaternions unit and do not apply joint-state normalization to TCP.",
         }
+        if self.tcp_quaternion_order == "xyzw":
+            contract.update(schema_version=2, quaternion_order="xyzw", target_pose_array=self.target_pose_array,
+                            array_quaternion_orders={"ee_pose_world_wxyz": "wxyz", self.target_pose_array: "xyzw"})
         if self.state_representation == "tcp_pose":
             contract.update(
                 state_representation="tcp_pose", state_contract=deepcopy(self.state_contract),
-                state=("Current-frame raw float32 TCP pose [1,14], world/meters/wxyz; preserved without normalization."
+                state=(f"Current-frame raw float32 TCP pose [1,14], world/meters/{self.tcp_quaternion_order}; preserved without normalization."
                        if self.include_state else "Current TCP pose state is disabled; future TCP targets remain enabled."),
             )
         (save_path.parent / "target_tcp_contract.json").write_text(

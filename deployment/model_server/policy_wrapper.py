@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from deployment.model_server.pose_conventions import validate_quaternion_order
+
 
 TCP_KEY = "target_tcp_pose"
 TCP_ALIASES = ("tcp_pose", "target_pose")
@@ -50,6 +52,10 @@ def _conditioning(model_cfg):
         raise ValueError("Model and dataset state_representation disagree")
     contract = dict(contract)
     contract["state_representation"] = representation
+    order = validate_quaternion_order(contract.get("tcp_quaternion_order", data.get("tcp_quaternion_order", "wxyz")))
+    if validate_quaternion_order(data.get("tcp_quaternion_order", "wxyz")) != order:
+        raise ValueError("Model and dataset TCP quaternion orders disagree")
+    contract["tcp_quaternion_order"] = order
     return contract
 
 
@@ -119,6 +125,11 @@ class PolicyServerWrapper:
                     and self.conditioning.get("state_representation") == "tcp_pose")
             )
         ) else None
+        if self._tcp_contract is not None:
+            declared = self._tcp_contract.get("quaternion_order")
+            expected = self.conditioning["tcp_quaternion_order"]
+            if declared != expected and (declared is not None or expected == "xyzw"):
+                raise ValueError("Saved TCP contract and configured quaternion order disagree")
 
     def _state_normalizer(self, unnorm_key):
         from deployment.model_server.state_normalization import RoboTwinStateNormalizer
@@ -164,6 +175,8 @@ class PolicyServerWrapper:
             "model_state_space": ("raw_tcp_pose" if pose_state else "normalized") if include_state else None,
             "state_pose_contract": self._tcp_contract if pose_state else None,
             "state_normalization": ("none" if pose_state else "training_transform") if include_state else None,
+            "state_quaternion_order": contract.get("tcp_quaternion_order", "wxyz") if pose_state else None,
+            "tcp_quaternion_order": contract.get("tcp_quaternion_order", "wxyz") if include_tcp or pose_state else None,
             "tcp_pose_key": TCP_KEY if include_tcp else None,
             "tcp_pose_aliases": list(TCP_ALIASES) if include_tcp else [],
             "tcp_pose_contract": self._tcp_contract,
@@ -180,10 +193,15 @@ class PolicyServerWrapper:
         include_state = self.conditioning.get("include_state", False)
         include_tcp = self.conditioning.get("include_tcp", False)
         raw_state = self.conditioning.get("state_input_space", "raw") == "raw"
+        expected_order = self.conditioning.get("tcp_quaternion_order", "wxyz")
         normalizer = self._state_normalizer(unnorm_key) if include_state and raw_state else None
         prepared = []
         for index, example in enumerate(examples):
             converted = dict(example)
+            if include_tcp or (include_state and self.conditioning.get("state_representation") == "tcp_pose"):
+                supplied_order = converted.get("tcp_quaternion_order", expected_order)
+                if validate_quaternion_order(supplied_order) != expected_order:
+                    raise ValueError(f"OFT example {index} requires TCP quaternion order {expected_order}")
             if include_state:
                 if converted.get("state") is None:
                     raise ValueError(f"OFT example {index} requires state when include_state=True")
