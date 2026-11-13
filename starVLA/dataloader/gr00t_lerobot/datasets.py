@@ -3155,16 +3155,20 @@ class LeRobotSingleDataset(Dataset):
             sample["action_valid_mask"] = action_valid_mask.astype(np.float32)
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
+            state_dtype = (
+                np.float32 if self.data_cfg.get("state_representation") == "tcp_pose"
+                and self.modality_keys["state"] == ["state.tcp_pose"] else np.float16
+            )
             if "state" in data:
                 state = data["state"]
                 if isinstance(state, torch.Tensor):
                     state = state.detach().cpu().numpy()
-                state = state.astype(np.float16)
+                state = state.astype(state_dtype)
             else:
                 state = []
                 for state_key in self.modality_keys["state"]:
                     state.append(data[state_key])
-                state = np.concatenate(state, axis=1).astype(np.float16)
+                state = np.concatenate(state, axis=1).astype(state_dtype)
             sample["state"] = state
 
         return sample

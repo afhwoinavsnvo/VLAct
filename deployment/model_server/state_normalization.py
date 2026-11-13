@@ -12,7 +12,7 @@ import numpy as np
 
 
 class RoboTwinStateNormalizer:
-    """Normalize [left joints, right joints, left gripper, right gripper]."""
+    """Apply the saved joint-state transform or preserve explicit raw TCP state."""
 
     KEY_DIMS = {
         "state.left_joints": 6,
@@ -39,9 +39,15 @@ class RoboTwinStateNormalizer:
         if not robot_type.startswith("robotwin"):
             raise ValueError("This raw-state adapter supports RoboTwin training configurations only")
         data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+        representation = data_cfg.get("state_representation", "joint")
+        if representation not in ("joint", "tcp_pose"):
+            raise ValueError("state_representation must be 'joint' or 'tcp_pose'")
+        self.pose_state = representation == "tcp_pose"
+        if self.pose_state:
+            self.KEY_DIMS = {"state.tcp_pose": 14}
         self.state_keys = list(data_config.state_keys)
         if self.state_keys != list(self.KEY_DIMS):
-            raise ValueError("Training state key order does not match the RoboTwin 14D state contract")
+            raise ValueError("Training state keys do not match the selected RoboTwin state representation")
 
         state_stats = statistics.get("state")
         if not isinstance(state_stats, dict):
@@ -89,6 +95,10 @@ class RoboTwinStateNormalizer:
             values = values[None, :]
         if values.shape != (1, 14) or not np.isfinite(values).all():
             raise ValueError("Raw RoboTwin state must be a finite vector shaped [14] or [1,14]")
+        if self.pose_state:
+            quaternions = values[:, [3, 4, 5, 6, 10, 11, 12, 13]].reshape(-1, 4)
+            if not np.allclose(np.linalg.norm(quaternions, axis=-1), 1.0, rtol=0, atol=1e-5):
+                raise ValueError("TCP pose state requires unit wxyz quaternions for both arms")
         parts = {}
         start = 0
         for key in self.state_keys:

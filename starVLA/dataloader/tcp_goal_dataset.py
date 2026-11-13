@@ -1,7 +1,8 @@
 """Add dynamic TCP targets to an existing LeRobot mixture dataset.
 
-Images, language, normalized joint state, and actions come from the original
-dataset unchanged. Only TCP target fields are added. The dataset manifest's
+Images, language, state, and actions come from the base dataset unchanged.
+Legacy state is normalized joint state; the opt-in pose-state dataset supplies
+raw current TCP pose instead. Only TCP target fields are added. The manifest's
 goal policy is always passed explicitly to the shared sampling helper.
 """
 
@@ -22,6 +23,31 @@ from examples.Robotwin.train_files.prepare_clean_tcp_dataset import (
     RAW_LAST_GOAL_POLICY,
     sample_target_tcp_pose,
 )
+
+
+TCP_POSE_STATE_MIX = "robotwin_tcp_state_wrap_32"
+TCP_POSE_STATE_LAYOUT = [
+    f"{side}_{component}" for side in ("left", "right")
+    for component in ("x", "y", "z", "qw", "qx", "qy", "qz")
+]
+
+
+def _validate_pose_state_contract(contract):
+    expected = {
+        "schema_version": 1, "state_representation": "tcp_pose",
+        "feature": "observation.state", "source_feature": "observation.tcp_pose",
+        "backup_joint_feature": "observation.joint_state",
+        "current_frame": True, "normalization_applied": False,
+        "dtype": "float32", "shape": [14], "coordinate_frame": "world",
+        "position_unit": "meters", "quaternion_order": "wxyz", "layout": TCP_POSE_STATE_LAYOUT,
+    }
+    if not isinstance(contract, dict):
+        raise ValueError("Pose-state dataset manifest requires a state_contract mapping")
+    for key, value in expected.items():
+        if contract.get(key) != value or type(contract.get(key)) is not type(value):
+            raise ValueError(f"Invalid pose-state contract field {key!r}; expected {value!r}")
+    if not isinstance(contract.get("tcp_definition"), str) or not contract["tcp_definition"]:
+        raise ValueError("Pose-state contract requires its TCP definition")
 
 
 def _read_json(path):
@@ -58,6 +84,7 @@ class TCPGoalDataset(Dataset):
     def __init__(
         self, base, data_root: Path, *, seed: int | None = None, cache_size: int = 32,
         include_state: bool = True, expected_target_schema_version: int | None = None,
+        state_representation: str | None = None,
     ):
         if not isinstance(cache_size, int) or isinstance(cache_size, bool) or cache_size < 1:
             raise ValueError("TCP cache_size must be a positive integer.")
@@ -73,10 +100,30 @@ class TCPGoalDataset(Dataset):
         self.seed = None if seed is None else int(seed)
         self.cache_size = cache_size
         self.include_state = include_state
+        data_cfg = getattr(base, "data_cfg", None)
+        configured_state = data_cfg.get("state_representation") if data_cfg is not None else None
+        if state_representation is None:
+            state_representation = configured_state or "joint"
+        elif configured_state is not None and state_representation != configured_state:
+            raise ValueError("Explicit TCP wrapper state_representation disagrees with the base dataset")
+        if state_representation not in ("joint", "tcp_pose"):
+            raise ValueError("TCP state_representation must be 'joint' or 'tcp_pose'")
+        self.state_representation = state_representation
+        data_mix = data_cfg.get("data_mix") if data_cfg is not None else None
+        if ((data_mix == TCP_POSE_STATE_MIX) != (state_representation == "tcp_pose")):
+            raise ValueError("TCP pose state requires the matching data_mix and explicit state_representation='tcp_pose'")
         self._manifest_path = self.data_root / "preparation_manifest.json"
         manifest = _read_json(self._manifest_path)
         if manifest.get("status") != "passed":
             raise ValueError(f"TCP dataset manifest must have status 'passed': {self._manifest_path}")
+        self.state_contract = None
+        if self.state_representation == "tcp_pose":
+            if manifest.get("state_representation") != "tcp_pose":
+                raise ValueError("Pose-state config requires state_representation='tcp_pose' in its dataset manifest")
+            self.state_contract = deepcopy(manifest.get("state_contract"))
+            _validate_pose_state_contract(self.state_contract)
+        elif manifest.get("state_representation") == "tcp_pose":
+            raise ValueError("Pose-state dataset requires explicit state_representation='tcp_pose' in the loader config")
         self.target_sampling = deepcopy(manifest.get("target_sampling"))
         if self.target_sampling not in (GOAL_POLICY, RAW_LAST_GOAL_POLICY):
             raise ValueError(f"Unsupported TCP target_sampling policy in {self._manifest_path}")
@@ -160,6 +207,8 @@ class TCPGoalDataset(Dataset):
                 raise ValueError(f"Invalid chunks_size in {task_dir / 'meta/info.json'}")
             if not isinstance(contract.get("sidecar_template"), str):
                 raise ValueError(f"Missing TCP sidecar_template in {task_dir / 'meta/tcp_pose.json'}")
+            if self.state_representation == "tcp_pose":
+                self._validate_pose_state_metadata(task_dir, info, contract)
             self._task_metadata[name] = (info, contract)
         info, contract = self._task_metadata[name]
         subset = Path(subset_path).expanduser()
@@ -175,8 +224,45 @@ class TCPGoalDataset(Dataset):
                 view_contract = _read_json(subset / "meta/tcp_pose.json")
                 if view_contract != contract:
                     raise ValueError(f"Temporary subset TCP contract differs from {task_dir}: {subset}")
+                if self.state_representation == "tcp_pose":
+                    self._validate_pose_state_metadata(subset, info, contract)
             self._checked_subsets.add(subset_key)
         return task_dir, info, contract
+
+    def _validate_pose_state_metadata(self, task_dir, info, tcp_contract):
+        state_contract = _read_json(task_dir / "meta/state_pose.json")
+        if state_contract != self.state_contract:
+            raise ValueError(f"Task/root pose-state contract mismatch: {task_dir}")
+        for key in ("coordinate_frame", "position_unit", "quaternion_order", "layout", "tcp_definition"):
+            if state_contract[key] != tcp_contract.get(key):
+                raise ValueError(f"Current state and target TCP contract disagree on {key}: {task_dir}")
+        features = info.get("features", {})
+        for name in ("observation.state", "observation.joint_state"):
+            feature = features.get(name, {})
+            if feature.get("dtype") != "float32" or feature.get("shape") != [14]:
+                raise ValueError(f"Pose-state dataset requires {name} float32[14]: {task_dir}")
+        names = features["observation.state"].get("names")
+        if names != TCP_POSE_STATE_LAYOUT and names != [TCP_POSE_STATE_LAYOUT]:
+            raise ValueError(f"Pose-state feature names do not match the TCP layout: {task_dir}")
+        state_mapping = _read_json(task_dir / "meta/modality.json").get("state", {})
+        if (set(state_mapping) != {"tcp_pose"}
+                or any(state_mapping["tcp_pose"].get(key) != value for key, value in (
+                    ("start", 0), ("end", 14), ("original_key", "observation.state"),
+                ))):
+            raise ValueError(f"Pose-state modality must map only state.tcp_pose to observation.state[0:14]: {task_dir}")
+
+    def _validate_current_pose_state(self, state, sequence, step, name, episode_id):
+        if isinstance(state, torch.Tensor):
+            if state.dtype != torch.float32:
+                raise ValueError("Current TCP pose state must preserve raw float32 values")
+            state = state.detach().cpu().numpy()
+        if not isinstance(state, np.ndarray) or state.dtype != np.float32 or not np.isfinite(state).all():
+            raise ValueError("Current TCP pose state must be a finite raw float32 array")
+        n_clean = self._episode_lengths[(name, episode_id)]
+        if not 0 <= step < n_clean:
+            raise ValueError("Current TCP pose state must refer to a Clean observation frame")
+        if not np.array_equal(state[0], sequence[step]):
+            raise ValueError("Current TCP pose state differs from the same-step TCP sidecar; check state transforms/alignment")
 
     def _full_tcp(self, name, episode_id, task_dir, info, contract):
         key = (name, episode_id)
@@ -223,6 +309,8 @@ class TCPGoalDataset(Dataset):
         if missing:
             raise ValueError(f"TCP wrapper requires base sample fields {missing}.")
         if self.include_state and (sample["state"] is None or tuple(getattr(sample["state"], "shape", ())) != (1, 14)):
+            if self.state_representation == "tcp_pose":
+                raise ValueError("TCP wrapper requires current raw TCP pose state shaped [1,14]")
             raise ValueError("TCP wrapper requires the original normalized joint state shaped [1,14]; enable include_state=True.")
         for key in ("trajectory_id", "step_index"):
             value = sample[key]
@@ -232,6 +320,8 @@ class TCPGoalDataset(Dataset):
         name, episode_id, step = sample["dataset_name"], int(sample["trajectory_id"]), int(sample["step_index"])
         task_dir, info, contract = self._metadata_for_task(name, sample["subset_path"])
         sequence = self._full_tcp(name, episode_id, task_dir, info, contract)
+        if self.include_state and self.state_representation == "tcp_pose":
+            self._validate_current_pose_state(sample["state"], sequence, step, name, episode_id)
         goal = sample_target_tcp_pose(sequence, step, self._rng, target_sampling=self.target_sampling)
         conflicts = goal.keys() & sample.keys()
         if conflicts:
@@ -272,5 +362,11 @@ class TCPGoalDataset(Dataset):
             "tcp_statistics_file": stats_target.name,
             "statistics_note": "Training full-sequence diagnostics. Positions may support later normalization; keep wxyz quaternions unit and do not apply joint-state normalization to TCP.",
         }
+        if self.state_representation == "tcp_pose":
+            contract.update(
+                state_representation="tcp_pose", state_contract=deepcopy(self.state_contract),
+                state=("Current-frame raw float32 TCP pose [1,14], world/meters/wxyz; preserved without normalization."
+                       if self.include_state else "Current TCP pose state is disabled; future TCP targets remain enabled."),
+            )
         (save_path.parent / "target_tcp_contract.json").write_text(
             json.dumps(contract, indent=2, allow_nan=False) + "\n", encoding="utf-8")

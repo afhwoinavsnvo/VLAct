@@ -1330,6 +1330,34 @@ class AgilexWrapData32Config(AgilexWrapData50Config):
     action_indices = list(range(32))
 
 
+class AgilexTCPPoseStateWrapData32Config(AgilexWrapData32Config):
+    """Raw current TCP pose state with the original joint/gripper actions."""
+
+    state_keys = ["state.tcp_pose"]
+
+    def transform(self, data_cfg=None):
+        if data_cfg is None or data_cfg.get("state_representation") != "tcp_pose":
+            raise ValueError("robotwin_tcp_state_wrap_32 requires explicit state_representation='tcp_pose'")
+        # Reuse the exact original action transforms; no joint normalization,
+        # gripper thresholding, or joint/gripper reordering applies to pose state.
+        original = _build_dual_arm_joint_gripper_transform(
+            state_keys=AgilexData50Config.state_keys,
+            action_keys=self.action_keys,
+            binary_threshold=0.49,
+            gripper_mode="binary",
+            action_joint_mode="wrap",
+        )
+        action_transforms = [
+            transform for transform in original.transforms
+            if any(key.startswith("action.") for key in transform.apply_to)
+        ]
+        return ComposedModalityTransform(transforms=[
+            *_build_configured_video_resize_transforms(data_cfg=data_cfg, video_keys=self.video_keys),
+            StateActionToTensor(apply_to=self.state_keys),
+            *action_transforms,
+        ])
+
+
 class InternA1FrankaDataConfig:
     video_keys = [
         "video.primary_image",
@@ -1879,6 +1907,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "robotwin50": AgilexData50Config(),
     "robotwin_wrap": AgilexWrapDataConfig(),
     "robotwin_wrap32": AgilexWrapData32Config(),
+    "robotwin_tcp_state_wrap32": AgilexTCPPoseStateWrapData32Config(),
     "robotwin_wrap50": AgilexWrapData50Config(),
     "ROBOCOIN.AgileX_flip_wrap": RoboCoinJointFlipWrapDataConfig(),
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),

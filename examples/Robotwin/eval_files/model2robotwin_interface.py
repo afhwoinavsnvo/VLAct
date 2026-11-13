@@ -51,12 +51,15 @@ class ModelClient:
         self.include_state = self.conditioning_enabled and conditioning.get("include_state", False)
         self.include_tcp = self.conditioning_enabled and conditioning.get("include_tcp", False)
         self.state_input_space = conditioning.get("state_input_space", "raw") if conditioning is not None else None
+        self.state_representation = conditioning.get("state_representation", "joint") if conditioning is not None else "joint"
         self._training_data_cfg = model_config.get("datasets", {}).get("vla_data", {})
         self._client_state_normalizer = None
         self.joint_action_unnorm_mode = self._infer_joint_action_unnorm_mode(policy_ckpt_path)
         if self.conditioning_enabled:
             data_mix = str(self._training_data_cfg.get("data_mix", ""))
-            self.joint_action_unnorm_mode = "wrap" if data_mix.startswith("robotwin_wrap") else "stats"
+            self.joint_action_unnorm_mode = "wrap" if (
+                data_mix.startswith("robotwin_wrap") or data_mix == "robotwin_tcp_state_wrap_32"
+            ) else "stats"
 
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
@@ -397,6 +400,36 @@ def _format_instruction(instruction: str, control_frequency: Optional[int | floa
     return f"{instruction} Control frequency: {control_frequency}Hz."
 
 
+def _current_tcp_pose(observation):
+    """Read an explicit current TCP or convert the current EE observations."""
+    value = observation.get("current_tcp_pose")
+    if value is not None:
+        pose = np.asarray(value, dtype=np.float32).reshape(-1)
+        if pose.shape != (14,) or not np.isfinite(pose).all():
+            raise ValueError("current_tcp_pose must be a finite 14D pose")
+        if not np.allclose(np.linalg.norm(pose[[3, 4, 5, 6, 10, 11, 12, 13]].reshape(2, 4), axis=-1),
+                           1.0, rtol=0, atol=1e-5):
+            raise ValueError("current_tcp_pose requires unit wxyz quaternions")
+        return pose
+    endpose = observation.get("endpose", {})
+    arms = []
+    for arm in ("left", "right"):
+        value = endpose.get(f"{arm}_endpose")
+        if value is None:
+            raise ValueError("TCP state requires current_tcp_pose or current left/right endpose observations")
+        ee = np.asarray(value, dtype=np.float64)
+        if ee.shape != (7,) or not np.isfinite(ee).all():
+            raise ValueError("Current endpose must be finite [x,y,z,qw,qx,qy,qz]")
+        w, x, y, z = ee[3:]
+        norm_sq = float(np.dot(ee[3:], ee[3:]))
+        if not np.isclose(np.sqrt(norm_sq), 1.0, rtol=0, atol=1e-5):
+            raise ValueError("Current endpose requires a unit wxyz quaternion")
+        tcp = ee.copy()
+        tcp[:3] += 0.12 * np.asarray([w*w+x*x-y*y-z*z, 2*(x*y+w*z), 2*(x*z-w*y)]) / norm_sq
+        arms.append(tcp)
+    return np.concatenate(arms).astype(np.float32)
+
+
 def eval(TASK_ENV, model, observation):
     instruction = _format_instruction(
         str(TASK_ENV.get_instruction()),
@@ -408,10 +441,14 @@ def eval(TASK_ENV, model, observation):
     right_img = observation["observation"]["right_camera"]["rgb"]
     images = [head_img, left_img, right_img]
 
-    state = observation["joint_action"]["vector"]
-    if getattr(model, "conditioning_enabled", False) and getattr(model, "include_state", False):
-        # RoboTwin: L6,Lgrip,R6,Rgrip; training DataConfig: L6,R6,Lgrip,Rgrip.
-        state = np.asarray(state)[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
+    conditioned_state = getattr(model, "conditioning_enabled", False) and getattr(model, "include_state", False)
+    if conditioned_state and getattr(model, "state_representation", "joint") == "tcp_pose":
+        state = _current_tcp_pose(observation)
+    else:
+        state = observation["joint_action"]["vector"]
+        if conditioned_state:
+            # RoboTwin: L6,Lgrip,R6,Rgrip; training DataConfig: L6,R6,Lgrip,Rgrip.
+            state = np.asarray(state)[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
     example = {
         "lang": instruction,
         "image": images,

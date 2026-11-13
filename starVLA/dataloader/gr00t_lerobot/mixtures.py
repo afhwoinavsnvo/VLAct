@@ -450,6 +450,11 @@ DATASET_NAMED_MIXTURES["robotwin_wrap_32"] = [
     for dataset_name, dataset_weight, _ in DATASET_NAMED_MIXTURES["robotwin"]
 ]
 
+DATASET_NAMED_MIXTURES["robotwin_tcp_state_wrap_32"] = [
+    (dataset_name, dataset_weight, "robotwin_tcp_state_wrap32")
+    for dataset_name, dataset_weight, _ in DATASET_NAMED_MIXTURES["robotwin_wrap_32"]
+]
+
 DATASET_NAMED_MIXTURES["robotwin_wrap_50"] = [
     (dataset_name, dataset_weight, "robotwin_wrap50")
     for dataset_name, dataset_weight, _ in DATASET_NAMED_MIXTURES["robotwin"]

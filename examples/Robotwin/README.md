@@ -150,6 +150,52 @@ observation must not be substituted for that future target.
 VLM 全程冻结，只训练输出 projection、两个 encoder 和随机初始化 OFT 头。
 完整 50 项闭环 benchmark 与训练入口分开，CPU/数据检查不代表已完成 benchmark。
 
+### Current TCP pose as the state input
+
+An independent dataset variant is available at:
+
+```text
+/scratch/jliu3375/datasets/RoboTwin-Clean-TCP-PoseState
+```
+
+Its `observation.state` is the same observation frame's raw, float32 TCP pose:
+left `[x,y,z,qw,qx,qy,qz]` followed by right `[x,y,z,qw,qx,qy,qz]`, in world
+coordinates and meters. The original joint/gripper observation is backed up
+as `observation.joint_state`. The original `observation.tcp_pose`, joint/gripper
+actions, language, frame/episode IDs and future-target TCP sidecars remain
+aligned with the original Clean observations. Video directories share the
+original Clean files through links; no video files are copied.
+
+Use `robotwin_tcp_state_wrap_32` and explicit `state_representation: tcp_pose`.
+This opt-in reader preserves state values and float32 precision, with no
+joint normalization, gripper thresholding, angle wrapping or state reordering.
+The action transforms remain the original joint-wrap32 transforms. Future
+`target_tcp_pose` continues to use Clean-last schema 2 independently of the
+current pose state. Its two input switches remain independent.
+
+The separate recipe `train_files/starvla_oft_tcp_pose_state.yaml` computes new
+state statistics and has its own run ID. It keeps FlashAttention2, the original
+100-step extra-batch diagnostic and the original seed timing. The earlier
+released checkpoint expects joint state; the pose-state variant requires a
+newly trained state encoder/head.
+
+```bash
+# Recreate the independent folder; an existing output is never overwritten.
+python examples/Robotwin/train_files/prepare_tcp_state_dataset.py
+
+# Full task/episode/frame correspondence, including all sidecars and videos.
+python examples/Robotwin/train_files/check_tcp_state_correspondence.py \
+  --report /scratch/jliu3375/logs/tcp_pose_state_clean_correspondence.json
+
+# Validate this recipe before starting a new run.
+bash examples/Robotwin/train_files/run_oft_state_tcp.sh \
+  --config examples/Robotwin/train_files/starvla_oft_tcp_pose_state.yaml --validate-only
+
+# Start the independent pose-state run when ready.
+bash examples/Robotwin/train_files/run_oft_state_tcp.sh \
+  --config examples/Robotwin/train_files/starvla_oft_tcp_pose_state.yaml --wandb
+```
+
 ## Upstream baseline workflow and results
 
 The workflow and published scores below are retained from the upstream

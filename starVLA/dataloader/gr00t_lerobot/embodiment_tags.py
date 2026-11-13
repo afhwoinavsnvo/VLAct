@@ -99,6 +99,7 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "robotwin50": EmbodimentTag.NEW_EMBODIMENT,
     "robotwin_wrap": EmbodimentTag.NEW_EMBODIMENT,
     "robotwin_wrap32": EmbodimentTag.NEW_EMBODIMENT,
+    "robotwin_tcp_state_wrap32": EmbodimentTag.NEW_EMBODIMENT,
     "robotwin_wrap50": EmbodimentTag.NEW_EMBODIMENT,
     "split_aloha_flip_wrap50": EmbodimentTag.SPLIT_ALOHA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,

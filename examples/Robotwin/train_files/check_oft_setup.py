@@ -70,8 +70,17 @@ def check_training_config(config) -> list[str]:
         legacy = _boolean(data, "use_target_tcp", "datasets.vla_data", issues)
         if legacy is not None and type(data.get("include_tcp")) is bool and legacy != data["include_tcp"]:
             issues.append("datasets.vla_data.include_tcp and use_target_tcp explicitly disagree")
-    if data.get("data_mix") != "robotwin_wrap_32":
-        issues.append("datasets.vla_data.data_mix must be robotwin_wrap_32")
+    representation = data.get("state_representation", "joint")
+    if representation not in ("joint", "tcp_pose"):
+        issues.append("datasets.vla_data.state_representation must be joint or tcp_pose")
+    model_representation = conditioning.get("state_representation", representation)
+    if model_representation != representation:
+        issues.append("Model and dataset state_representation disagree")
+    expected_mix = "robotwin_tcp_state_wrap_32" if representation == "tcp_pose" else "robotwin_wrap_32"
+    if data.get("data_mix") != expected_mix:
+        issues.append(f"datasets.vla_data.data_mix must be {expected_mix} for {representation} state")
+    if representation == "tcp_pose" and data.get("pretrained_stats_path"):
+        issues.append("TCP pose state must compute its own dataset statistics; do not reuse joint-state statistics")
     for key, expected in (("tcp_target_schema_version", 2), ("expected_task_count", 50),
                           ("expected_episodes_per_task", 50)):
         _integer_is(data, key, expected, "datasets.vla_data", issues)
@@ -170,7 +179,9 @@ def _check_checkpoint(config, issues):
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             issues.append(f"Cannot read source checkpoint config: {exc}")
     statistics = data.get("pretrained_stats_path", str(checkpoint.parent.parent / "dataset_statistics.json"))
-    if not isinstance(statistics, str) or not statistics:
+    if data.get("state_representation", "joint") == "tcp_pose" and not statistics:
+        summary["statistics_source"] = "computed from the TCP-pose-state dataset"
+    elif not isinstance(statistics, str) or not statistics:
         issues.append("Pretrained dataset statistics path must be configured")
     else:
         statistics_path = _path(statistics)
@@ -219,6 +230,9 @@ def _check_data(config, issues):
     policy = manifest.get("target_sampling")
     if manifest.get("status") != "passed":
         issues.append("TCP dataset manifest status must be passed")
+    representation = data.get("state_representation", "joint")
+    if manifest.get("state_representation", "joint") != representation:
+        issues.append("Dataset manifest and configured state_representation disagree")
     if policy != GOAL_POLICY:
         issues.append("TCP dataset target_sampling must match Clean-last GOAL_POLICY schema 2; RawLast is not allowed")
     summary["target_schema_version"] = policy.get("schema_version") if isinstance(policy, dict) else None
@@ -255,6 +269,24 @@ def _check_data(config, issues):
             feature = info.get("features", {}).get("observation.tcp_pose", {})
             if feature.get("dtype") != "float32" or feature.get("shape") != [14]:
                 issues.append(f"{name}: TCP feature must be float32[14]")
+            if representation == "tcp_pose":
+                state_contract = _read_json(task_dir / "meta/state_pose.json")
+                if state_contract != manifest.get("state_contract"):
+                    issues.append(f"{name}: task and root state contracts disagree")
+                for key, value in (("state_representation", "tcp_pose"), ("current_frame", True),
+                                   ("normalization_applied", False), ("coordinate_frame", "world"),
+                                   ("position_unit", "meters"), ("quaternion_order", "wxyz"), ("layout", POSE_LAYOUT)):
+                    if state_contract.get(key) != value:
+                        issues.append(f"{name}: invalid current TCP state {key}")
+                state_feature = info.get("features", {}).get("observation.state", {})
+                backup = info.get("features", {}).get("observation.joint_state", {})
+                if state_feature.get("dtype") != "float32" or state_feature.get("shape") != [14]:
+                    issues.append(f"{name}: state must be float32[14] TCP pose")
+                if backup.get("dtype") != "float32" or backup.get("shape") != [14]:
+                    issues.append(f"{name}: original joint-state backup is missing")
+                modality = _read_json(task_dir / "meta/modality.json")
+                if modality.get("state") != {"tcp_pose": {"start": 0, "end": 14, "original_key": "observation.state"}}:
+                    issues.append(f"{name}: state modality must be the complete raw TCP vector")
             record["episodes"] = len(episodes)
             record["frames"] = sum(int(ep["public_length"]) for ep in episodes)
             ids = [ep["public_episode_id"] for ep in episodes]
@@ -276,6 +308,8 @@ def _check_data(config, issues):
                 try:
                     metadata = pq.ParquetFile(parquet)
                     missing = {"observation.state", "action", "frame_index", "observation.tcp_pose"} - set(metadata.schema_arrow.names)
+                    if representation == "tcp_pose" and "observation.joint_state" not in metadata.schema_arrow.names:
+                        missing.add("observation.joint_state")
                     if missing:
                         issues.append(f"{parquet}: missing columns {sorted(missing)}")
                     else:

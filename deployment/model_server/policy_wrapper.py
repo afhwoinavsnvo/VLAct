@@ -42,6 +42,14 @@ def _conditioning(model_cfg):
         _boolean(contract.get(key, False), f"conditioning.{key}")
     if contract.get("include_state", False) and contract.get("state_input_space", "raw") not in ("raw", "normalized"):
         raise ValueError("conditioning.state_input_space must be 'raw' or 'normalized'")
+    data = model_cfg.get("datasets", {}).get("vla_data", {})
+    representation = contract.get("state_representation", data.get("state_representation", "joint"))
+    if representation not in ("joint", "tcp_pose"):
+        raise ValueError("conditioning.state_representation must be 'joint' or 'tcp_pose'")
+    if data.get("state_representation", "joint") != representation:
+        raise ValueError("Model and dataset state_representation disagree")
+    contract = dict(contract)
+    contract["state_representation"] = representation
     return contract
 
 
@@ -105,7 +113,11 @@ class PolicyServerWrapper:
         self.conditioning = _conditioning(self.model_cfg)
         self._normalizers = {}
         self._tcp_contract = _read_tcp_contract(self.model_cfg, checkpoint_path) if (
-            self.conditioning is not None and self.conditioning.get("include_tcp", False)
+            self.conditioning is not None and (
+                self.conditioning.get("include_tcp", False)
+                or (self.conditioning.get("include_state", False)
+                    and self.conditioning.get("state_representation") == "tcp_pose")
+            )
         ) else None
 
     def _state_normalizer(self, unnorm_key):
@@ -129,6 +141,7 @@ class PolicyServerWrapper:
         active = self.conditioning is not None
         include_state = active and contract.get("include_state", False)
         include_tcp = active and contract.get("include_tcp", False)
+        pose_state = include_state and contract.get("state_representation") == "tcp_pose"
         horizon = getattr(self.policy, "chunk_len", None)
         if horizon is None:
             horizon = action.get("action_horizon")
@@ -147,7 +160,10 @@ class PolicyServerWrapper:
             "state_dim": int(contract.get("state_dim", 14)) if include_state else 0,
             "tcp_dim": int(contract.get("tcp_dim", 14)) if include_tcp else 0,
             "state_input_space": contract.get("state_input_space", "raw") if include_state else None,
-            "model_state_space": "normalized" if include_state else None,
+            "state_representation": contract.get("state_representation", "joint") if include_state else None,
+            "model_state_space": ("raw_tcp_pose" if pose_state else "normalized") if include_state else None,
+            "state_pose_contract": self._tcp_contract if pose_state else None,
+            "state_normalization": ("none" if pose_state else "training_transform") if include_state else None,
             "tcp_pose_key": TCP_KEY if include_tcp else None,
             "tcp_pose_aliases": list(TCP_ALIASES) if include_tcp else [],
             "tcp_pose_contract": self._tcp_contract,
