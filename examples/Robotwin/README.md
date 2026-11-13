@@ -4,7 +4,7 @@ This document provides instructions for reproducing our **experimental results**
 
 ## Local VLAct OFT with state and target TCP
 
-The local experiment uses this VLAct checkout (`feat/oft-state-tcp`),
+The original joint-state experiment uses this VLAct checkout (`feat/oft-state-tcp`),
 `train_files/starvla_oft_state_tcp.yaml`, and the actual TCP-enriched data root:
 
 ```text
@@ -213,6 +213,60 @@ bash examples/Robotwin/train_files/run_oft_state_tcp.sh \
 # Start the independent pose-state run when ready.
 bash examples/Robotwin/train_files/run_oft_state_tcp.sh \
   --config examples/Robotwin/train_files/starvla_oft_tcp_pose_state.yaml --wandb
+```
+
+### Four-GPU fast training and checkpoint uploads
+
+`run_oft_state_tcp.sh` now defaults to the XYZW pose-state recipe above, using
+GPUs `0,1,6,7` and four native DDP processes. With batch size 32 per device
+and accumulation 1, the global batch size is 128. From this repository, run:
+
+```bash
+bash examples/Robotwin/train_files/run_oft_state_tcp.sh --wandb
+```
+
+`CUDA_VISIBLE_DEVICES` and `NUM_PROCESSES` can override the script defaults.
+The launcher defaults `NCCL_NVLS_ENABLE=0` for the local H100 node's NVLS
+multicast initialization error (CUDA 401), retaining ordinary NVLink/P2P
+communication. Explicit environment overrides remain supported.
+
+The recipe prepares the same Qwen processor inputs inside CPU data-loader
+workers and transfers those tensors without splitting flattened image patches
+across examples. PyAV decoding uses one thread per codec to avoid excessive
+decoder threads during random-frame access. Images, prompts, sampling RNGs,
+action targets and model outputs retain their existing contracts.
+
+W&B and terminal logs include `grad_norm` at the configured logging interval.
+This is the total gradient norm **before** clipping; values above the clipping
+threshold of 1.0 are expected. The existing extra-batch `mse_score` diagnostic
+and its historical formula described above are unchanged.
+
+The latest recipe enables `trainer.allow_tf32: true` and
+`trainer.optimizer.fused: true` for subsequent runs. TF32 permits reduced
+mantissa precision for FP32 matrix multiplication without changing stored
+weight dtypes; fused AdamW uses PyTorch's fused optimizer implementation.
+Other configurations retain their defaults when these options are absent.
+The completed 50k-step fast run did not enable either option; use its saved
+`config.full.yaml` when reproducing that run's numerical settings.
+
+`trainer.hf_upload` enables model uploads to the configured Hugging Face
+repository (`afhwoinavsnvo/VLAct-OFT-TCP-PoseState` in this local recipe).
+Authentication uses the standard HF token environment or login cache. Change
+the repository ID and visibility in the recipe to select another destination.
+The destination is checked before loading the VLM. Every 10k-step save and
+the final model are queued for serial background upload with matching configs,
+dataset statistics and TCP contracts. Upload subprocesses can connect to HF
+while the training process keeps offline model loading.
+
+Checkpoint saves use atomic replacement. Each upload keeps an immutable local
+hardlink and metadata snapshot, so retries are safe even when a later run
+reuses the same output filenames. Each job records `job.json`, `status.json`
+and `upload.log` under `<output_dir>/hf_uploads/`; failures retain the local
+weights and have bounded retries. To retry a job without starting training:
+
+```bash
+python starVLA/training/trainer_utils/hf_checkpoint_upload.py \
+  --job /path/to/run/hf_uploads/steps_10000_<id>/job.json
 ```
 
 ## Upstream baseline workflow and results

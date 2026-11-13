@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+from collections.abc import Mapping
+
 import av
 import cv2
 import numpy as np
@@ -35,6 +37,21 @@ try:
     TORCHCODEC_AVAILABLE = True
 except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
+
+
+def _configure_pyav_decoder(stream, video_backend_kwargs):
+    """Apply explicit decoder options without changing PyAV's defaults."""
+    if not isinstance(video_backend_kwargs, Mapping):
+        raise TypeError("video_backend_kwargs must be a mapping")
+    if "thread_count" not in video_backend_kwargs:
+        return
+    thread_count = video_backend_kwargs["thread_count"]
+    if type(thread_count) is not int:
+        raise TypeError("PyAV thread_count must be a nonnegative integer")
+    if thread_count < 0:
+        raise ValueError("PyAV thread_count must be a nonnegative integer")
+    # Configure before the first decode opens the codec. Zero retains auto.
+    stream.codec_context.thread_count = thread_count
 
 
 def get_frames_by_indices(
@@ -74,6 +91,7 @@ def get_frames_by_indices(
         try:
             container = av.open(video_path)
             stream = container.streams.video[0]
+            _configure_pyav_decoder(stream, video_backend_kwargs)
             time_base = float(stream.time_base)
             fps = float(stream.average_rate) if stream.average_rate else float(stream.guessed_rate)
             
@@ -186,6 +204,7 @@ def get_frames_by_timestamps(
         try:
             container = av.open(video_path)
             stream = container.streams.video[0]
+            _configure_pyav_decoder(stream, video_backend_kwargs)
             
             # Get video properties
             time_base = float(stream.time_base)
@@ -323,11 +342,12 @@ def get_all_frames(
         frames = decoder.get_frames_at(indices=range(len(decoder)))
         return frames.data.numpy(), frames.pts_seconds.numpy()
     elif video_backend == "pyav":
-        container = av.open(video_path)
-        frames = []
-        for frame in container.decode(video=0):
-            frame = frame.to_ndarray(format="rgb24")
-            frames.append(frame)
+        with av.open(video_path) as container:
+            _configure_pyav_decoder(container.streams.video[0], video_backend_kwargs)
+            frames = []
+            for frame in container.decode(video=0):
+                frame = frame.to_ndarray(format="rgb24")
+                frames.append(frame)
         frames = np.array(frames)
     elif video_backend == "torchvision_av":
         # set backend and reader

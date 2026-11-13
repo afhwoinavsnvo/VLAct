@@ -36,6 +36,7 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
+from starVLA.training.trainer_utils.hf_checkpoint_upload import HFCheckpointUploader
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, normalize_dotlist_args
 from starVLA.training.trainer_utils.wandb_setup import resolve_wandb_entity
 
@@ -47,6 +48,9 @@ logger = get_logger(__name__)
 
 
 def create_accelerator(cfg) -> Accelerator:
+    allow_tf32 = getattr(cfg.trainer, "allow_tf32", None)
+    if allow_tf32 is not None:
+        torch.backends.cuda.matmul.allow_tf32 = _as_bool(allow_tf32)
     gradient_accumulation_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
     deepspeed_plugin = (None if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1"
                        else DeepSpeedPlugin(gradient_accumulation_steps=gradient_accumulation_steps))
@@ -55,6 +59,11 @@ def create_accelerator(cfg) -> Accelerator:
         gradient_accumulation_steps=gradient_accumulation_steps,
     )
     accelerator.print(accelerator.state)
+    if allow_tf32 is not None:
+        accelerator.print(f"TF32 for FP32 CUDA matmul: {_as_bool(allow_tf32)} (storage dtypes unchanged)")
+    fused = getattr(getattr(cfg.trainer, "optimizer", None), "fused", None)
+    if fused is not None:
+        accelerator.print(f"AdamW fused optimizer: {_as_bool(fused)}")
     return accelerator
 
 
@@ -99,6 +108,11 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
+    if cfg.datasets.vla_data.get("qwen_cpu_preprocessing", False):
+        # Image patches are flattened across examples; shard indices before
+        # worker collation rather than splitting prepared tensor dimensions.
+        accelerator.dataloader_config.split_batches = False
+        accelerator.dataloader_config.non_blocking = True
     if dist.is_initialized():
         dist.barrier()
     return vla_train_dataloader
@@ -107,12 +121,17 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
     """Set optimizer and scheduler."""
     param_groups = build_param_lr_groups(model=model, cfg=cfg)
+    optimizer_options = {}
+    fused = getattr(cfg.trainer.optimizer, "fused", None)
+    if fused is not None:
+        optimizer_options["fused"] = _as_bool(fused)
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=cfg.trainer.learning_rate.base,
         betas=tuple(cfg.trainer.optimizer.betas),
         weight_decay=cfg.trainer.optimizer.weight_decay,
         eps=cfg.trainer.optimizer.eps,
+        **optimizer_options,
     )
 
     if dist.is_initialized() and dist.get_rank() == 0:
@@ -162,6 +181,37 @@ def initialize_wandb(config, accelerator):
         raise RuntimeError(failure[0]) from local_error
     accelerator.wait_for_everyone()
     return True
+
+
+def initialize_hf_upload(config, accelerator):
+    """Check the upload destination before loading the model, on rank zero only."""
+    upload_config = getattr(getattr(config, "trainer", None), "hf_upload", None)
+    if upload_config is None or not _as_bool(upload_config.get("enabled", False)):
+        return None
+
+    uploader = None
+    failure = [None]
+    local_error = None
+    if accelerator.is_main_process:
+        try:
+            uploader = HFCheckpointUploader(
+                repo_id=upload_config.get("repo_id", ""),
+                output_dir=config.output_dir,
+                private=_as_bool(upload_config.get("private", True)),
+                max_retries=upload_config.get("max_retries", 3),
+            )
+            uploader.prepare()
+        except Exception as error:
+            local_error = error
+            failure[0] = f"Hugging Face upload setup failed before model loading: {error}"
+    if dist.is_initialized():
+        dist.broadcast_object_list(failure, src=0)
+    if failure[0] is not None:
+        if uploader is not None:
+            uploader.close(wait=False)
+        raise RuntimeError(failure[0]) from local_error
+    accelerator.wait_for_everyone()
+    return uploader
 
 
 class VLATrainer(TrainerUtils):
@@ -291,11 +341,14 @@ class VLATrainer(TrainerUtils):
             if save_format == "safetensors":
                 from safetensors.torch import save_file
 
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
+                checkpoint_path += "_model.safetensors"
+                save_file(state_dict, checkpoint_path + ".tmp")
             elif save_format == "pt":
-                torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+                checkpoint_path += "_pytorch_model.pt"
+                torch.save(state_dict, checkpoint_path + ".tmp")
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            os.replace(checkpoint_path + ".tmp", checkpoint_path)
 
             summary_data = {"steps": self.completed_steps}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
@@ -307,6 +360,10 @@ class VLATrainer(TrainerUtils):
                 output_dir = Path(self.config.output_dir)
                 self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
                 logger.info("✅ Configuration files saved")
+
+            uploader = getattr(self, "_hf_uploader", None)
+            if uploader is not None:
+                uploader.enqueue(checkpoint_path, self.completed_steps)
 
         self.accelerator.wait_for_everyone()
 
@@ -391,9 +448,10 @@ class VLATrainer(TrainerUtils):
     def eval_action_model(self, step_metrics: dict = None) -> dict:
         """Original extra-batch action diagnostic, compatible with native DDP."""
         step_metrics = {} if step_metrics is None else step_metrics
-        examples = self._get_next_batch()
+        batch = self._get_next_batch()
+        examples = batch["examples"] if isinstance(batch, dict) and "qwen_inputs" in batch else batch
         actions = [example["action"] for example in examples]
-        output_dict = _unwrap_model(self.accelerator, self.model).predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
+        output_dict = _unwrap_model(self.accelerator, self.model).predict_action(examples=batch, use_ddim=True, num_ddim_steps=20)
 
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
@@ -412,6 +470,7 @@ class VLATrainer(TrainerUtils):
                 step_metrics["mse_score"] = float(score / valid_count)
 
         del examples
+        del batch
         if dist.is_initialized():
             dist.barrier()
         return step_metrics
@@ -474,6 +533,7 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
+        grad_norm = None
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
@@ -483,7 +543,9 @@ class VLATrainer(TrainerUtils):
             self.accelerator.backward(total_loss)
 
             if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                grad_norm = self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), self.config.trainer.gradient_clipping
+                )
 
             self.optimizer.step()
             if self.accelerator.sync_gradients:
@@ -494,6 +556,9 @@ class VLATrainer(TrainerUtils):
             "action_loss": action_loss.item(),
             "action_dit_loss": action_loss.item(),
         }
+        if grad_norm is not None:
+            # The clipping call returns the total norm before clipping.
+            metrics["grad_norm"] = float(grad_norm)
         if "action_dit_loss" in output_dict:
             metrics["action_dit_loss"] = output_dict["action_dit_loss"].item()
         if "oft_loss" in output_dict:
@@ -514,12 +579,20 @@ class VLATrainer(TrainerUtils):
             if save_format == "safetensors":
                 from safetensors.torch import save_file
 
-                save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
+                checkpoint_path = os.path.join(final_checkpoint, "model.safetensors")
+                save_file(state_dict, checkpoint_path + ".tmp")
             elif save_format == "pt":
-                torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+                checkpoint_path = os.path.join(final_checkpoint, "pytorch_model.pt")
+                torch.save(state_dict, checkpoint_path + ".tmp")
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            os.replace(checkpoint_path + ".tmp", checkpoint_path)
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+
+            uploader = getattr(self, "_hf_uploader", None)
+            if uploader is not None:
+                uploader.enqueue(checkpoint_path, self.completed_steps, final=True)
+                uploader.close(wait=False)
 
         if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):
             wandb.finish()
@@ -534,6 +607,7 @@ def main(cfg, accelerator) -> None:
     logger.info("✅ Configuration wrapped for access tracking")
 
     output_dir = setup_directories(cfg=cfg)
+    hf_uploader = initialize_hf_upload(cfg, accelerator)
     wandb_enabled = initialize_wandb(cfg, accelerator)
     vla = build_framework(cfg)
     if accelerator.is_main_process:
@@ -553,6 +627,7 @@ def main(cfg, accelerator) -> None:
     )
 
     trainer._wandb_enabled = wandb_enabled
+    trainer._hf_uploader = hf_uploader
     trainer.prepare_training()
     trainer.train()
 
@@ -560,6 +635,10 @@ def main(cfg, accelerator) -> None:
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+    if hf_uploader is not None:
+        # Uploads can take longer than the process-group timeout. Drain only
+        # after the other ranks have finished and communication is torn down.
+        hf_uploader.close(wait=True)
 
 
 if __name__ == "__main__":

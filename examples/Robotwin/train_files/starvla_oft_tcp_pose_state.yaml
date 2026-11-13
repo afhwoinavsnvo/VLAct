@@ -1,5 +1,4 @@
-# Independent recipe: current TCP pose state plus a separate future TCP target.
-run_id: vlact_oft_tcp_pose_state_xyzw_wrap32
+run_id: vlact_oft_tcp_pose_state_xyzw_wrap32_fast
 run_root_dir: /scratch/jliu3375/runs
 seed: 42
 is_debug: false
@@ -50,18 +49,21 @@ datasets:
     drop_incomplete_action_chunks: false
     action_mode: abs
     action_type: abs_qpos
-    # State is raw TCP pose: compute new state statistics rather than loading
-    # the joint-state statistics from the previous run.
     pretrained_stats_path: null
     balance_dataset_weights: true
     sequential_step_sampling: false
-    per_device_batch_size: 16
+    per_device_batch_size: 32
     num_workers: 4
+    # Prepare identical processor tensors in workers while the GPU computes.
+    qwen_cpu_preprocessing: true
     pin_memory: true
     persistent_workers: false
     image_size: [224, 224]
     image_size_buckets: [[320, 180], [280, 210]]
     video_backend: pyav
+    # Avoid creating hundreds of AV1 decoder threads for each random frame.
+    video_backend_kwargs:
+      thread_count: 1
     CoT_prompt: 'Robot: AgileX, Action: Absolute joint. FPS: 15. Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format.'
 
 trainer:
@@ -72,9 +74,16 @@ trainer:
   is_resume: false
   reset_steps: true
   enable_gradient_checkpointing: false
+  # Use H100 Tensor Cores for FP32 matmuls; weights remain FP32.
+  allow_tf32: true
   max_train_steps: 50000
   num_warmup_steps: 5000
   save_interval: 10000
+  hf_upload:
+    enabled: true
+    repo_id: afhwoinavsnvo/VLAct-OFT-TCP-PoseState
+    private: false
+    max_retries: 3
   eval_interval: 100
   logging_frequency: 100
   gradient_clipping: 1.0
@@ -88,6 +97,7 @@ trainer:
   scheduler_specific_kwargs:
     min_lr: 5.0e-7
   optimizer:
+    fused: true
     betas: [0.9, 0.95]
     eps: 1.0e-8
     weight_decay: 1.0e-8

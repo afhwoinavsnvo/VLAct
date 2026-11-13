@@ -122,6 +122,11 @@ def make_LeRobotSingleDataset(
     normalization_group = embodiment_tag.value
     
     video_backend = effective_data_cfg.get("video_backend", "decord") if effective_data_cfg else "torchvision_av"
+    video_backend_kwargs = effective_data_cfg.get("video_backend_kwargs", {}) if effective_data_cfg else {}
+    if OmegaConf.is_config(video_backend_kwargs):
+        video_backend_kwargs = OmegaConf.to_container(video_backend_kwargs, resolve=True)
+    if not isinstance(video_backend_kwargs, dict):
+        raise TypeError("datasets.vla_data.video_backend_kwargs must be a mapping")
     return LeRobotSingleDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
@@ -130,6 +135,7 @@ def make_LeRobotSingleDataset(
         robot_type=robot_type,
         normalization_group=normalization_group,
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
+        video_backend_kwargs=dict(video_backend_kwargs),
         delete_pause_frame=delete_pause_frame,
         data_cfg=effective_data_cfg,
     )

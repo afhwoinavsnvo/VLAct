@@ -107,6 +107,9 @@ def check_training_config(config) -> list[str]:
     if type(workers) is not int or workers < 0:
         issues.append("datasets.vla_data.num_workers must be a nonnegative integer")
     _boolean(data, "pin_memory", "datasets.vla_data", issues)
+    cpu_preprocessing = _boolean(data, "qwen_cpu_preprocessing", "datasets.vla_data", issues)
+    if cpu_preprocessing and "Qwen3-VL" not in framework.get("qwenvl", {}).get("base_vlm", ""):
+        issues.append("Qwen OFT worker preprocessing requires the Qwen3-VL processor")
     for key in ("reload_modules", "freeze_modules"):
         if trainer.get(key) != "qwen_vl_interface":
             issues.append(f"trainer.{key} must be 'qwen_vl_interface'")

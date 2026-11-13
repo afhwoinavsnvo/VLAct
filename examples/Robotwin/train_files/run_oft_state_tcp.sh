@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Run from this VLAct checkout; all training data comes from the TCP root.
+# Four-GPU XYZW TCP-pose-state training with the released Clean OFT VLM frozen.
 set -euo pipefail
 
-TRAIN_GPU_IDS="0,7"
-TRAIN_NUM_PROCESSES=2
+TRAIN_GPU_IDS="0,1,6,7"
+TRAIN_NUM_PROCESSES=4
 TRAIN_WANDB_ENTITY="vlact-ljy666"
 TRAIN_WANDB_CREATE_TEAM=""
+
+# This H100 node fails NVLS multicast binding with CUDA error 401.
+# Use the regular NVLink/P2P collectives; allow an explicit override.
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 python_bin="${VLACT_PYTHON:-${STARVLA_PYTHON:-python}}"
-config_path="$script_dir/starvla_oft_state_tcp.yaml"
+config_path="$script_dir/starvla_oft_tcp_pose_state.yaml"
 validate_only=false
 config_only=false
 wandb_mode="${WANDB_MODE:-disabled}"

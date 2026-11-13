@@ -72,6 +72,14 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         pin_memory = vla_dataset_cfg.get("pin_memory", False)
         if type(pin_memory) is not bool:
             raise TypeError("datasets.vla_data.pin_memory must be a boolean.")
+
+        cpu_preprocessing = vla_dataset_cfg.get("qwen_cpu_preprocessing", False)
+        if type(cpu_preprocessing) is not bool:
+            raise TypeError("datasets.vla_data.qwen_cpu_preprocessing must be a boolean.")
+        if cpu_preprocessing:
+            from starVLA.dataloader.oft_cpu_preprocessing import QwenOFTCPUCollator
+
+            collate_fn = QwenOFTCPUCollator(cfg)
         
         vla_train_dataloader = DataLoader(
             vla_dataset,

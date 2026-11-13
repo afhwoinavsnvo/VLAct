@@ -20,6 +20,7 @@ Note: How to add special tokens to Qwen2.5:
   
 """
 from contextlib import nullcontext
+from collections.abc import Mapping
 from typing import List
 from tqdm import tqdm
 from typing import List, Optional, Tuple
@@ -195,6 +196,45 @@ class Qwenvl_OFT(baseframework):
         ) if self.conditioning.include_tcp else None
         return self.conditioning(action_queries, state=state, tcp=tcp)
 
+    def _prepare_vlm_inputs(self, examples, *, inference=False):
+        """Accept worker-prepared tensors or retain the original image path."""
+        if isinstance(examples, Mapping) and "qwen_inputs" in examples:
+            batch = examples.get("examples")
+            inputs = examples["qwen_inputs"]
+            if not isinstance(batch, list) or not batch or not isinstance(inputs, Mapping):
+                raise ValueError("Prepared OFT batches require examples and qwen_inputs")
+            input_ids = inputs.get("input_ids")
+            if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2 or input_ids.shape[0] != len(batch):
+                raise ValueError("Prepared OFT input_ids must match the example batch")
+            device = next(self.qwen_vl_interface.parameters()).device
+            inputs = {key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+                      for key, value in inputs.items()}
+            return batch, inputs
+
+        if inference and type(examples) is not list:
+            examples = [examples]
+        batch_images = [to_pil_preserve(example["image"]) if inference else example["image"]
+                        for example in examples]
+        instructions = [example["lang"] for example in examples]
+        if inference:
+            self._log_batch_image_sizes_once(batch_images, stage="infer_recv")
+        image_size_buckets = getattr(self.config.datasets.vla_data, "image_size_buckets", None)
+        image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if self.conditioning.enabled:
+            batch_images = preprocess_image_batch(
+                batch_images, image_size_buckets=image_size_buckets, image_size=image_size,
+            )
+        elif image_size_buckets is None and image_size:
+            batch_images = resize_images(batch_images, target_size=image_size)
+        if not inference:
+            self._log_batch_image_sizes_once(batch_images, stage="train")
+        action_tokens = self.action_token * self.chunk_len
+        suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
+        inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images, instructions=[instruction + suffix for instruction in instructions],
+        )
+        return examples, inputs
+
     def _log_batch_image_sizes_once(self, batch_images: List[List[Image.Image]], stage: str = "train") -> None:
         if self._logged_first_batch_image_sizes:
             return
@@ -240,32 +280,13 @@ class Qwenvl_OFT(baseframework):
             dict:
                 action_loss (torch.Tensor): Scalar supervised action-regression loss.
         """
-        batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
+        examples, qwen_inputs = self._prepare_vlm_inputs(examples)
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         robot_tags = [example.get("robot_tag") or example.get("robot_type") for example in examples]
         action_layout_tags = [example.get("robot_type", example.get("robot_tag")) for example in examples]
         action_valid_masks = [example.get("action_valid_mask") for example in examples]
         action_dim_valid_masks = [example.get("action_dim_valid_mask") for example in examples]
 
-        image_size_buckets = getattr(self.config.datasets.vla_data, "image_size_buckets", None)
-        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-        if self.conditioning.enabled:
-            batch_images = preprocess_image_batch(
-                batch_images, image_size_buckets=image_size_buckets, image_size=train_obs_image_size,
-            )
-        elif image_size_buckets is None and train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
-
-        self._log_batch_image_sizes_once(batch_images, stage="train")
-        
-        # step 0: add special action token to instruction
-        action_tokens = self.action_token* self.chunk_len #can't add " " between two tokens, otherwise will be tokenized to multiple tokens
-        prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
-        instructions = [instruction + prompt_suffix for instruction in instructions]
-
-        # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         last_hidden = self._last_hidden(qwen_inputs)  # [B, L, hidden_dim]
 
         # Step 4: Action Expert Forward and Loss
@@ -344,28 +365,7 @@ class Qwenvl_OFT(baseframework):
             dict:
                 normalized_actions (np.ndarray): Shape [B, T, action_dim], directly regressed actions.
         """
-        if type(examples) is not list:
-            examples = [examples]
-        batch_images = [to_pil_preserve(example["image"]) for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-        self._log_batch_image_sizes_once(batch_images, stage="infer_recv")
-    
-        image_size_buckets = getattr(self.config.datasets.vla_data, "image_size_buckets", None)
-        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-        if self.conditioning.enabled:
-            batch_images = preprocess_image_batch(
-                batch_images, image_size_buckets=image_size_buckets, image_size=train_obs_image_size,
-            )
-        elif image_size_buckets is None and train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
-    
-        # step 0: add special action token to instruction
-        action_tokens = self.action_token* self.chunk_len #can't add " " between two tokens, otherwise will be tokenized to multiple tokens
-        prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
-        instructions = [instruction + prompt_suffix for instruction in instructions]
-
-        # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        examples, qwen_inputs = self._prepare_vlm_inputs(examples, inference=True)
         last_hidden = self._last_hidden(qwen_inputs)  # [B, L, hidden_dim]
 
         # Step 4: Action Expert Forward and Loss
