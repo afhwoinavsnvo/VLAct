@@ -373,8 +373,7 @@ class VLATrainer(TrainerUtils):
 
             if self.accelerator.sync_gradients:
                 eval_interval = int(self.config.trainer.get("eval_interval", 0))
-                if (eval_interval > 0 and self.completed_steps % eval_interval == 0
-                        and self._action_error_diagnostics_enabled()):
+                if eval_interval > 0 and self.completed_steps % eval_interval == 0:
                     step_metrics = self.eval_action_model(step_metrics)
 
                 step_metrics["data_time"] = t_end_data - t_start_data
@@ -389,21 +388,9 @@ class VLATrainer(TrainerUtils):
 
         self._finalize_training()
 
-    def _action_error_diagnostics_enabled(self) -> bool:
-        """Raw subtraction does not match OFT's wrapped-angle objective."""
-        framework = self.config.get("framework", {})
-        data = self.config.get("datasets", {}).get("vla_data", {})
-        wrapped_oft = framework.get("name") == "QwenOFT" and (
-            "wrap" in str(data.get("data_mix", ""))
-            or _as_bool(self.config.trainer.get("shortest_angular_joint_loss", False))
-        )
-        return not wrapped_oft
-
     def eval_action_model(self, step_metrics: dict = None) -> dict:
-        """Optional raw-action diagnostics for non-wrapped representations."""
+        """Original extra-batch action diagnostic, compatible with native DDP."""
         step_metrics = {} if step_metrics is None else step_metrics
-        if not self._action_error_diagnostics_enabled():
-            return step_metrics
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
         output_dict = _unwrap_model(self.accelerator, self.model).predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
@@ -416,11 +403,13 @@ class VLATrainer(TrainerUtils):
             )
             valid_count = np.count_nonzero(valid_mask)
             if valid_count == 0:
-                raise ValueError("Cannot measure action error without valid target cells")
-            difference = pred_actions.astype(np.float64) - gt_actions.astype(np.float64)
-            # Training-loader diagnostics, not held-out validation or success rate.
-            step_metrics["train_action_mse"] = float(np.sum(difference ** 2 * valid_mask) / valid_count)
-            step_metrics["train_action_mae"] = float(np.sum(np.abs(difference) * valid_mask) / valid_count)
+                step_metrics["mse_score"] = 0.0
+            else:
+                score = TrainerUtils.euclidean_distance(
+                    pred_actions * valid_mask,
+                    gt_actions * valid_mask,
+                )
+                step_metrics["mse_score"] = float(score / valid_count)
 
         del examples
         if dist.is_initialized():
@@ -546,8 +535,6 @@ def main(cfg, accelerator) -> None:
 
     output_dir = setup_directories(cfg=cfg)
     wandb_enabled = initialize_wandb(cfg, accelerator)
-    # Initialize fresh heads/adapters reproducibly before rank-specific seeds.
-    set_seed(int(cfg.seed))
     vla = build_framework(cfg)
     if accelerator.is_main_process:
         full_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg

@@ -86,65 +86,107 @@ class WandbTrainingTests(unittest.TestCase):
             self.assertIsNone(init.call_args.kwargs["entity"])
             log.assert_not_called()
 
-    def test_training_batch_mse_and_mae_are_true_elementwise_errors(self):
+    def test_action_diagnostic_preserves_official_mse_score_and_ddp_unwrap(self):
         with tempfile.TemporaryDirectory() as folder:
             trainer = self.trainer(folder)
-            trainer._get_next_batch = lambda: [
+            examples = [
                 {"action": np.zeros((2, 2))}, {"action": np.zeros((1, 1))},
             ]
-            model = SimpleNamespace(predict_action=lambda **kwargs: {
-                "normalized_actions": [np.array([[1., 2.], [3., 4.]]), np.array([[5.]])],
-            })
+            trainer._get_next_batch = MagicMock(return_value=examples)
+            # The extra prediction cells have no matching target and must be
+            # masked out of both the Euclidean distance and valid-cell count.
+            model = SimpleNamespace(predict_action=MagicMock(return_value={
+                "normalized_actions": [np.array([[1., 2.], [3., 4.]]),
+                                       np.array([[5., 100.], [100., 100.]])],
+            }))
+            trainer.model = SimpleNamespace(module=model)
+            metrics = {"action_loss": 0.76}
+            with patch.object(training, "_unwrap_model", return_value=model) as unwrap, \
+                    patch.object(training.dist, "is_initialized", return_value=False):
+                result = trainer.eval_action_model(metrics)
+            self.assertIs(result, metrics)
+            self.assertEqual(metrics["action_loss"], 0.76)
+            # Preserve the official metric's name and formula, despite its
+            # historical name: this is L2 / count, rather than mean squared error.
+            self.assertAlmostEqual(metrics["mse_score"], np.sqrt(55.) / 5., places=7)
+            self.assertNotIn("train_action_mse", metrics)
+            self.assertNotIn("train_action_mae", metrics)
+            trainer._get_next_batch.assert_called_once_with()
+            unwrap.assert_called_once_with(trainer.accelerator, trainer.model)
+            model.predict_action.assert_called_once_with(examples=examples, use_ddim=True, num_ddim_steps=20)
+
+    def test_empty_action_targets_keep_official_zero_score(self):
+        with tempfile.TemporaryDirectory() as folder:
+            trainer = self.trainer(folder)
+            trainer._get_next_batch = MagicMock(return_value=[{"action": np.zeros((0, 2))}])
+            model = SimpleNamespace(predict_action=MagicMock(return_value={
+                "normalized_actions": np.zeros((1, 0, 2)),
+            }))
             trainer.model = model
             with patch.object(training, "_unwrap_model", return_value=model), \
                     patch.object(training.dist, "is_initialized", return_value=False):
                 metrics = trainer.eval_action_model({})
-            self.assertEqual(metrics["train_action_mse"], 11.0)
-            self.assertEqual(metrics["train_action_mae"], 3.0)
-            self.assertNotIn("mse_score", metrics)
+            self.assertEqual(metrics, {"mse_score": 0.0})
+            trainer._get_next_batch.assert_called_once_with()
 
-    def test_wrapped_oft_does_not_consume_an_extra_batch_or_report_raw_errors(self):
+    def test_nonmain_rank_consumes_diagnostic_batch_and_synchronizes(self):
         with tempfile.TemporaryDirectory() as folder:
-            trainer = self.trainer(folder)
-            trainer.config.framework.name = "QwenOFT"
-            trainer.config.datasets.vla_data.data_mix = "robotwin_wrap_32"
-            trainer._get_next_batch = MagicMock(side_effect=AssertionError("No diagnostic batch for wrapped OFT"))
+            trainer = self.trainer(folder, main=False)
+            trainer._get_next_batch = MagicMock(return_value=[{"action": np.zeros((1, 1))}])
+            model = SimpleNamespace(predict_action=MagicMock(return_value={
+                "normalized_actions": np.ones((1, 1, 1)),
+            }))
+            trainer.model = model
             metrics = {"action_loss": 0.76}
-            self.assertFalse(trainer._action_error_diagnostics_enabled())
-            self.assertIs(trainer.eval_action_model(metrics), metrics)
+            with patch.object(training, "_unwrap_model", return_value=model), \
+                    patch.object(training.dist, "is_initialized", return_value=True), \
+                    patch.object(training.dist, "barrier") as barrier:
+                self.assertIs(trainer.eval_action_model(metrics), metrics)
             self.assertEqual(metrics, {"action_loss": 0.76})
-            trainer._get_next_batch.assert_not_called()
+            trainer._get_next_batch.assert_called_once_with()
+            model.predict_action.assert_called_once()
+            barrier.assert_called_once_with()
 
-    def test_angular_loss_also_disables_raw_errors_without_a_wrap_mix_name(self):
-        with tempfile.TemporaryDirectory() as folder:
-            trainer = self.trainer(folder)
-            trainer.config.framework.name = "QwenOFT"
-            trainer.config.trainer.shortest_angular_joint_loss = True
-            self.assertFalse(trainer._action_error_diagnostics_enabled())
-
-    def test_main_loop_skips_disabled_diagnostics_at_an_old_eval_interval(self):
+    def test_wrapped_oft_main_loop_consumes_extra_batch_every_100_updates(self):
         with tempfile.TemporaryDirectory() as folder:
             trainer = self.trainer(folder)
             trainer.config.framework.name = "QwenOFT"
             trainer.config.datasets.vla_data.data_mix = "robotwin_wrap_32"
-            trainer.config.trainer.eval_interval = 1
-            trainer.config.trainer.max_train_steps = 1
-            trainer.config.trainer.save_interval = 100
+            trainer.config.trainer.shortest_angular_joint_loss = True
+            trainer.config.trainer.eval_interval = 100
+            trainer.config.trainer.max_train_steps = 201
+            trainer.config.trainer.save_interval = 1000
             trainer.completed_steps = 0
             trainer.accelerator.sync_gradients = True
             trainer.accelerator.is_local_main_process = False
-            trainer.model = MagicMock()
+            trainer.model = SimpleNamespace(train=MagicMock(), predict_action=MagicMock(return_value={
+                "normalized_actions": np.full((1, 1, 1), 2.),
+            }))
             trainer._log_training_config = MagicMock()
             trainer._create_data_iterators = MagicMock()
-            trainer._get_next_batch = MagicMock(return_value=[])
-            trainer._train_step = MagicMock(return_value={"action_loss": 0.76})
-            trainer._log_metrics = MagicMock()
+            trainer._get_next_batch = MagicMock(side_effect=[
+                [{"action": np.zeros((1, 1)), "sample_id": index}] for index in range(203)
+            ])
+            trainer._train_step = MagicMock(side_effect=lambda batch: {"action_loss": 0.76})
+            logged = []
+            trainer._log_metrics = MagicMock(side_effect=lambda metrics: logged.append(
+                (trainer.completed_steps, dict(metrics))))
             trainer._finalize_training = MagicMock()
-            trainer.eval_action_model = MagicMock(side_effect=AssertionError("Raw error evaluation must be skipped"))
-            trainer.train()
-            trainer._get_next_batch.assert_called_once()
-            trainer.eval_action_model.assert_not_called()
-            self.assertEqual(trainer._log_metrics.call_args.args[0]["action_loss"], 0.76)
+            with patch.object(training, "_unwrap_model", return_value=trainer.model), \
+                    patch.object(training.dist, "is_initialized", return_value=False):
+                trainer.train()
+            self.assertEqual(trainer.completed_steps, 201)
+            self.assertEqual(trainer._train_step.call_count, 201)
+            self.assertEqual(trainer._get_next_batch.call_count, 203)
+            diagnostic_ids = [call.kwargs["examples"][0]["sample_id"]
+                              for call in trainer.model.predict_action.call_args_list]
+            self.assertEqual(diagnostic_ids, [100, 201])
+            trained_ids = [call.args[0][0]["sample_id"] for call in trainer._train_step.call_args_list]
+            self.assertEqual(trained_ids, [index for index in range(203) if index not in diagnostic_ids])
+            self.assertEqual([(step, metrics["mse_score"]) for step, metrics in logged
+                              if "mse_score" in metrics], [(100, 2.0), (200, 2.0)])
+            self.assertTrue(all("train_action_mse" not in metrics and "train_action_mae" not in metrics
+                                for _, metrics in logged))
 
     def test_wandb_failure_precedes_any_model_loading(self):
         with tempfile.TemporaryDirectory() as folder:

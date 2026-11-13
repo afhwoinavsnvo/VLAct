@@ -36,6 +36,17 @@ the new projection/encoders/head trainable. There is no time-budget input or
 scheduled VLM unfreezing. Switches define the saved architecture at model
 initialization; restore checkpoints with matching switches.
 
+The current training launcher preserves the original FlashAttention2 backend,
+the extra action-diagnostic batch every 100 updates, and the original seed
+timing in `prepare_training`, after model construction. It does not set a seed
+before constructing the model. A configured seed therefore does not by itself
+control the new modules' initial weights, matching the original training flow.
+
+The previously released 50,000-step model used SDPA, disabled the extra action
+diagnostic, and set the seed before model construction. Its saved configuration
+and pinned code revision describe that completed experiment; the current
+launcher settings apply to subsequent runs.
+
 The output projection is an additional layer after action-token extraction;
 it does not unfreeze or replace the VLM's final Transformer layer. For the
 selected Qwen3-VL-4B recipe, initialization and training are:
@@ -112,8 +123,11 @@ never creates teams. `WANDB_NAME` overrides the displayed run name. W&B receives
 the resolved training configuration, action loss, per-module learning rates,
 epoch and data/model times every `trainer.logging_frequency` updates (100 by
 default). For this wrapped-angle OFT experiment, monitor `action_loss`.
-Raw-subtraction MSE/MAE diagnostics are disabled, including their extra batch
-and inference pass. The official joint objective blends half wrapped L1 with
+The original `mse_score` auxiliary diagnostic is also recorded every 100 updates,
+using an extra batch from the training loader on all ranks. Despite its name,
+it is the masked Euclidean norm divided by the valid element count, not mean
+squared error, held-out validation loss or a wrapped-angle metric. It does not
+update model parameters. The official joint objective blends half wrapped L1 with
 half ordinary L1; it is not pure shortest-angle MAE. Benchmark success is
 measured separately by closed-loop evaluation. For an offline node,
 use `--wandb-mode offline` and later `wandb sync /path/to/offline-run-directory`.
